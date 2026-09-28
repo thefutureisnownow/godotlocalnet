@@ -4,6 +4,19 @@ Offline local multiplayer for Godot 4: devices on the same Wi-Fi or phone hotspo
 
 The design follows Coldshift Racing's Flutter `net_core` (unicast subnet sweep for discovery, a host-owned lobby, clock sync, UDP for real-time traffic), rebuilt on Godot's built-in ENet.
 
+## Using it in a game
+
+Games take the addon as a plain folder, pulled from the `addon` branch with git subtree, so they build with no extra steps:
+
+```sh
+# Once, in the game's repo:
+git subtree add --prefix=addons/localnet https://github.com/stained/godotlocalnet addon --squash
+# For each update:
+git subtree pull --prefix=addons/localnet https://github.com/stained/godotlocalnet addon --squash
+```
+
+Change LocalNet here, never in a game's copy. After the tests pass, bump `addons/localnet/VERSION`, commit, and run `tools/publish_addon.sh` to update the `addon` branch.
+
 ## The addon
 
 | Class | Job |
