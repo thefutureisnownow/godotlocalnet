@@ -5,11 +5,11 @@ extends Control
 #
 # Command-line options (after --): --host, --join[=address[:port]], --name=NAME,
 # --delay=N (default auto), --seconds=N, --players=N, --matches=N, --free, --port=N,
-# --drop=0.1, --latency=MS, --jitter=MS, --hiccup=MS, --no-time-sync, --loopback,
-# --results=DIR, --quit.
+# --drop=0.1, --latency=MS, --jitter=MS, --hiccup=MS, --drop-connection=MS,
+# --no-time-sync, --loopback, --results=DIR, --quit.
 
 const GAME := "localnet-linktest"
-const VERSION := 3
+const VERSION := 4
 const TICK_RATE := 120
 const INPUT_BYTES := 2
 const LANE_WIDTH := 10000
@@ -392,8 +392,23 @@ func new_lobby() -> LocalNetLobby:
 	l.returned.connect(on_returned)
 	l.rejected.connect(func(reason): status_label.text = "Turned away: " + reason)
 	l.closed.connect(on_closed)
-	l.member_left.connect(func(_id): end_test("A player left"))
+	l.member_left.connect(func(_id, reason): end_test("A player left" if reason == "left" else "A player lost their connection"))
+	l.member_interrupted.connect(func(_id): refresh_members())
+	l.member_resumed.connect(on_resumed)
+	l.connection_interrupted.connect(show_reconnecting)
+	l.connection_resumed.connect(on_resumed)
 	return l
+
+
+func on_resumed(_id := 0) -> void:
+	if not run.is_empty():
+		run.reconnections += 1
+	refresh_members()
+
+
+func show_reconnecting() -> void:
+	if screen == "lobby" and status_label:
+		status_label.text = "Connection lost, reconnecting…"
 
 
 func on_preparing(_config: Dictionary) -> void:
@@ -451,7 +466,7 @@ func begin_test(config: Dictionary, start_usec: int) -> void:
 	for slot in players:
 		positions[slot] = LANE_WIDTH >> 1
 	bot.seed = hash(player_name()) + lobby.local_slot()
-	run = {"delay": delay, "total": int(config.get("seconds", 60)) * TICK_RATE, "players": players, "desync_tick": -1, "checksums": 0, "began_usec": Time.get_ticks_usec()}
+	run = {"delay": delay, "total": int(config.get("seconds", 60)) * TICK_RATE, "players": players, "desync_tick": -1, "checksums": 0, "reconnections": 0, "began_usec": Time.get_ticks_usec()}
 	screen = "test"
 	clear()
 	heading("%s · slot %d of %d · delay %d (%.0f ms)" % [config.get("mode", "lockstep"), lobby.local_slot(), players, delay, delay * 1000.0 / TICK_RATE])
@@ -489,6 +504,10 @@ func step_test() -> void:
 		if options.has("hiccup") and not run.has("hiccup") and runner.tick >= 3 * TICK_RATE:
 			run.hiccup = true
 			lobby.link.debug_hold(float(options.hiccup))
+		# A dropped connection three seconds in, back after the given pause.
+		if options.has("drop-connection") and not run.has("dropped") and runner.tick >= 3 * TICK_RATE:
+			run.dropped = true
+			lobby.link.debug_drop_connection(LocalNetLink.HOST_ID if not lobby.is_host else lobby.link.peers()[0], float(options["drop-connection"]))
 	if canvas:
 		canvas.queue_redraw()
 	if Engine.get_process_frames() % 15 == 0:
@@ -545,6 +564,9 @@ func live_stats(now: int) -> String:
 	var waiting := ""
 	if runner.is_waiting():
 		waiting = " · waiting for " + ", ".join(runner.waiting_on().map(slot_name))
+	for id in lobby.link.interrupted_peers():
+		var who: String = "the host" if id == LocalNetLink.HOST_ID and not lobby.is_host else lobby.members.get(id, {}).get("name", "a player")
+		waiting += " · lost %s, reconnecting (%.0f s left)" % [who, lobby.link.reconnect_seconds_left(id)]
 	lines.append("Tick %d / %d · %s%s" % [runner.tick, run.total, "DESYNC at %d" % run.desync_tick if run.desync_tick >= 0 else "in sync", waiting])
 	lines.append(peer_line())
 	lines.append(stall_line())
@@ -597,6 +619,7 @@ func end_test(reason: String) -> void:
 	lines.append("Ran %d of %d ticks at %d Hz with input delay %d (%.1f ms) over %.1f s" % [runner.tick, run.total, TICK_RATE, sync.delay, sync.delay * 1000.0 / TICK_RATE, (now - run.began_usec) / 1_000_000.0])
 	lines.append(peer_line())
 	lines.append(stall_line())
+	lines.append("Reconnections %d" % run.reconnections)
 	if runner.predict:
 		lines.append("Free-run: %d of %d ticks ran on a guess (%.1f%%): the share rollback would have had to correct" % [runner.predicted_ticks, runner.tick, 100.0 * runner.predicted_ticks / maxi(runner.tick, 1)])
 	else:

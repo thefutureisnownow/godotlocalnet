@@ -39,6 +39,10 @@ func run() -> void:
 	stale_sessions()
 	lobby_edges()
 	delay_cap()
+	reconnects()
+	broken_sockets()
+	lobby_reconnects()
+	lockstep_through_drop()
 	desync()
 	departures()
 	stats()
@@ -549,6 +553,197 @@ func delay_cap() -> void:
 	host.leave()
 
 
+func link_pair(window_msec := 3000) -> Array:
+	var host := LocalNetLink.new()
+	host.reconnect_window_msec = window_msec
+	host.host(0, 4)
+	var guest := LocalNetLink.new()
+	guest.reconnect_window_msec = window_msec
+	guest.join("127.0.0.1", host.port)
+	pump([host, guest], 3.0, func(): return host.peers().size() == 1 and guest.peers().size() == 1)
+	return [host, guest]
+
+
+func events_of(link: LocalNetLink) -> Array:
+	var log := []
+	link.peer_connected.connect(func(id): log.append("connected %d" % id))
+	link.peer_interrupted.connect(func(id): log.append("interrupted %d" % id))
+	link.peer_resumed.connect(func(id): log.append("resumed %d" % id))
+	link.peer_disconnected.connect(func(id, reason): log.append("gone %d %s" % [id, reason]))
+	return log
+
+
+func talks(pair: Array) -> bool:
+	var heard := []
+	var listen := func(id, _channel, bytes): heard.append([id, bytes.get_string_from_utf8()])
+	for link in pair:
+		link.received.connect(listen)
+	pair[0].send(2, LocalNetLink.CHANNEL_CONTROL, "to guest".to_utf8_buffer(), true)
+	pair[1].send(1, LocalNetLink.CHANNEL_CONTROL, "to host".to_utf8_buffer(), true)
+	pair[0].flush()
+	pair[1].flush()
+	pump(pair, 2.0, func(): return heard.size() == 2)
+	for link in pair:
+		link.received.disconnect(listen)
+	return heard.has([1, "to guest"]) and heard.has([2, "to host"])
+
+
+func reconnects() -> void:
+	# The guest's connection drops; it comes back with the same id.
+	var pair := link_pair()
+	var host_log := events_of(pair[0])
+	var guest_log := events_of(pair[1])
+	pair[1].debug_drop_connection(LocalNetLink.HOST_ID, 400)
+	pump(pair, 0.2)
+	check(pair[0].interrupted_peers() == [2] and pair[0].reconnect_seconds_left(2) > 2.0, "The host holds a dropped guest's place (%s)" % [pair[0].interrupted_peers()])
+	check(pair[1].interrupted_peers() == [1] and not pair[1].is_peer_connected(1), "The guest knows it's reconnecting")
+	pump(pair, 4.0, func(): return guest_log.has("resumed 1") and host_log.has("resumed 2"))
+	check(host_log == ["interrupted 2", "resumed 2"], "Host: interrupted, then resumed with the same id: %s" % [host_log])
+	check(guest_log == ["interrupted 1", "resumed 1"], "Guest: interrupted, then resumed: %s" % [guest_log])
+	check(talks(pair), "Messages flow both ways after reconnecting")
+	check(pair[0].interrupted_peers().is_empty() and pair[1].interrupted_peers().is_empty(), "Nothing is left waiting after a resume")
+	# The host notices first this time.
+	host_log.clear()
+	guest_log.clear()
+	pair[0].debug_drop_connection(2)
+	pump(pair, 4.0, func(): return guest_log.has("resumed 1") and host_log.has("resumed 2"))
+	check(host_log == ["interrupted 2", "resumed 2"] and guest_log == ["interrupted 1", "resumed 1"], "A drop the host notices first heals the same way: %s %s" % [host_log, guest_log])
+	# Leaving on purpose ends it at once, with no waiting.
+	host_log.clear()
+	pair[1].close()
+	pump([pair[0]], 2.0, func(): return not host_log.is_empty())
+	check(host_log == ["gone 2 left"], "A guest leaving on purpose is gone at once: %s" % [host_log])
+	pair[0].close()
+
+	pair = link_pair()
+	guest_log = events_of(pair[1])
+	pair[0].close()
+	pump([pair[1]], 2.0, func(): return not guest_log.is_empty())
+	pump([pair[1]], 0.5)
+	check(guest_log == ["gone 1 left"], "A host leaving on purpose ends it for the guest, with no reconnecting: %s" % [guest_log])
+	pair[1].close()
+
+	# Back too late: the host has let the guest go, and says so.
+	pair = link_pair(3000)
+	pair[0].reconnect_window_msec = 700
+	host_log = events_of(pair[0])
+	guest_log = events_of(pair[1])
+	pair[1].debug_drop_connection(LocalNetLink.HOST_ID, 1500)
+	pump(pair, 4.0, func(): return guest_log.has("gone 1 lost"))
+	check(host_log == ["interrupted 2", "gone 2 lost"], "The host lets a guest go when the window runs out: %s" % [host_log])
+	check(guest_log.back() == "gone 1 lost", "A guest back too late is told it's gone: %s" % [guest_log])
+	for link in pair:
+		link.close()
+
+
+func broken_sockets() -> void:
+	# The host's socket breaks: it opens a new one, and the guest finds it again.
+	var pair := link_pair(10_000)
+	var host_log := events_of(pair[0])
+	var guest_log := events_of(pair[1])
+	var port: int = pair[0].port
+	pair[0].debug_break_socket()
+	check(pair[0].is_open() and pair[0].port == port and host_log == ["interrupted 2"], "A host with a broken socket reopens it on the same port")
+	pump(pair, 12.0, func(): return host_log.has("resumed 2") and guest_log.has("resumed 1"))
+	check(host_log == ["interrupted 2", "resumed 2"] and guest_log == ["interrupted 1", "resumed 1"], "The guest times out, reconnects and resumes: %s %s" % [host_log, guest_log])
+	# The guest's socket breaks: the host never noticed a drop, but takes it back anyway.
+	host_log.clear()
+	guest_log.clear()
+	pair[1].debug_break_socket()
+	pump(pair, 4.0, func(): return guest_log.has("resumed 1"))
+	pump(pair, 1.0)
+	check(guest_log == ["interrupted 1", "resumed 1"] and host_log == ["resumed 2"], "A guest with a broken socket resumes, replacing its old connection: %s %s" % [host_log, guest_log])
+	check(talks(pair), "Messages flow after both kinds of socket failure")
+	for link in pair:
+		link.close()
+
+
+func lobby_reconnects() -> void:
+	var host := host_lobby()
+	var guest := join_lobby(host, "Guest")
+	pump([host, guest], 4.0, func(): return host.can_start())
+	var events := []
+	host.member_interrupted.connect(func(id): events.append("host: %d interrupted" % id))
+	host.member_resumed.connect(func(id): events.append("host: %d resumed" % id))
+	guest.connection_interrupted.connect(func(): events.append("guest: interrupted"))
+	guest.connection_resumed.connect(func(): events.append("guest: resumed"))
+	var id := guest.local_id
+	guest.link.debug_drop_connection(LocalNetLink.HOST_ID, 500)
+	pump([host, guest], 0.2)
+	check(not host.members[id].connected and not host.can_start(), "A dropped member shows as not connected, and blocks the start")
+	host.set_config({"stage": 5})
+	pump([host, guest], 4.0, func(): return guest.config.get("stage") == 5)
+	check(guest.config.get("stage") == 5 and host.members[id].connected and guest.members[id].connected, "Back in the lobby, the guest catches up on what it missed")
+	check(events == ["guest: interrupted", "host: %d interrupted" % id, "guest: resumed", "host: %d resumed" % id] or events == ["host: %d interrupted" % id, "guest: interrupted", "guest: resumed", "host: %d resumed" % id], "Both sides hear about the drop and the return: %s" % [events])
+	# The match starts while the guest is away: it joins in when it's back.
+	var starts := {}
+	host.started.connect(func(_c, at): starts["host"] = at)
+	guest.started.connect(func(_c, at): starts["guest"] = at)
+	guest.link.debug_drop_connection(LocalNetLink.HOST_ID, 700)
+	pump([host, guest], 0.1)
+	host.start()
+	pump([host, guest], 4.0, func(): return starts.size() == 2)
+	check(starts.size() == 2 and absi(starts.get("guest", 0) - starts.get("host", 0)) < 5000, "A guest who missed the start starts with everyone else's clock")
+	# The host goes quiet for good: the guest gives up when the window runs out.
+	var closed := [""]
+	guest.closed.connect(func(r): closed[0] = r)
+	guest.link.reconnect_window_msec = 1000
+	host.link.debug_drop_connection(id)
+	host.link._enet.destroy()
+	host.link._enet = null
+	pump([guest], 4.0, func(): return closed[0] != "")
+	check(closed[0] == "Lost connection to the host", "A guest that can't get back says so: %s" % closed[0])
+	guest.leave()
+
+
+# A mid-match drop: both sides wait, the guest reconnects, and the match carries on in sync.
+func lockstep_through_drop() -> void:
+	var host := host_lobby()
+	var guest := join_lobby(host, "Guest")
+	var lobbies: Array[LocalNetLobby] = [host, guest]
+	pump(lobbies, 4.0, func(): return host.can_start())
+	var starts := {}
+	for lobby in lobbies:
+		lobby.started.connect(func(_config, at): starts[lobby] = at)
+	host.start()
+	pump(lobbies, 2.0, func(): return starts.size() == 2)
+	var runners := []
+	var desyncs := []
+	for lobby in lobbies:
+		var sync := LocalNetInputSync.new(lobby.link, 2, lobby.local_slot(), lobby.peer_slots(), 3, 2)
+		sync.desynced.connect(func(t, _id): desyncs.append(t))
+		var rng := RandomNumberGenerator.new()
+		rng.seed = lobby.local_slot() + 5
+		var history := PackedInt64Array()
+		var runner := LocalNetLockstep.new(sync, starts[lobby], 120,
+			func(_t): return PackedByteArray([rng.randi() % 256, rng.randi() % 256]),
+			func(_t, inputs): history.append(hash(inputs)),
+			func(): return history[-1])
+		runners.append({"runner": runner, "history": history})
+	var dropped := [false]
+	var ticks := 600
+	var step := func():
+		for r in runners:
+			if r.runner.tick < ticks:
+				r.runner.max_ticks_per_frame = mini(8, ticks - r.runner.tick)
+				r.runner.advance()
+			else:
+				r.runner.sync.flush()
+		if not dropped[0] and runners[1].runner.tick >= 200:
+			dropped[0] = true
+			guest.link.debug_drop_connection(LocalNetLink.HOST_ID, 800)
+		return runners.all(func(r): return r.runner.tick >= ticks)
+	var finished := pump(lobbies, 20.0, step)
+	pump(lobbies, 0.3)
+	check(dropped[0] and finished, "A match survives an 800 ms disconnection and finishes")
+	check(runners[0].history == runners[1].history and desyncs.is_empty(), "After reconnecting, both devices stepped identical inputs")
+	check(runners.all(func(r): return r.runner.longest_stall_usec >= 700_000), "Both sides waited out the drop rather than guessing")
+	for r in runners:
+		r.runner.sync.close()
+	for lobby in lobbies:
+		lobby.leave()
+
+
 func desync() -> void:
 	var host := host_lobby()
 	var client := join_lobby(host, "Guest")
@@ -577,10 +772,10 @@ func departures() -> void:
 	var client := join_lobby(host, "Guest")
 	pump([host, client], 3.0, func(): return host.members.size() == 2)
 	var left := []
-	host.member_left.connect(func(id): left.append(id))
+	host.member_left.connect(func(id, reason): left.append([id, reason]))
 	client.leave()
 	pump([host], 3.0, func(): return not left.is_empty())
-	check(left.size() == 1 and host.members.size() == 1, "Host notices a guest leaving")
+	check(left.size() == 1 and left[0][1] == "left" and host.members.size() == 1, "Host notices a guest leaving, on purpose")
 	var again := join_lobby(host, "Again")
 	pump([host, again], 3.0, func(): return host.members.size() == 2)
 	var reason := [""]

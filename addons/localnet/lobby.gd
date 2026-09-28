@@ -7,6 +7,14 @@ extends RefCounted
 ## the host picks becomes the same wall-clock moment on every device. The pings also say
 ## how steady each link is, which [method suggested_delay] turns into an input delay.
 ##
+## Dropped connections: when a guest's link drops, the host keeps its place (see
+## [member LocalNetLink.reconnect_window_msec]), marks it not [code]connected[/code] and
+## emits [signal member_interrupted] everywhere, while the guest emits
+## [signal connection_interrupted] and keeps reconnecting. When it's back, everyone gets
+## [signal member_resumed] and the guest [signal connection_resumed]; the host then
+## brings it up to date, including a start or return it missed. If the window runs out,
+## the host emits [signal member_left] and the guest [signal closed].
+##
 ## Control messages are Godot variants ([method @GlobalScope.var_to_bytes], decoded without
 ## objects) over the reliable channel, so numbers and vectors keep their types. Pings are
 ## binary and unreliable. Call [method poll] every frame.
@@ -15,7 +23,14 @@ signal members_changed
 signal joined(id: int)
 signal rejected(reason: String)
 signal closed(reason: String)
-signal member_left(id: int)
+## [param reason] is "left", "kicked" or "lost".
+signal member_left(id: int, reason: String)
+## A member's connection dropped; the host is holding their place.
+signal member_interrupted(id: int)
+signal member_resumed(id: int)
+## Guest only: the link to the host dropped and it's reconnecting.
+signal connection_interrupted
+signal connection_resumed
 ## With [member wait_for_loading]: load the match, then call [method mark_loaded].
 signal preparing(config: Dictionary)
 ## [param start_usec] is on this device's [method Time.get_ticks_usec] clock.
@@ -59,12 +74,15 @@ var _samples := []
 var _round_trips := PackedInt64Array()
 var _next_ping_usec := 0
 var _reported_synced := false
+var _start_at := 0
 
 
 func _init(game: String, game_version: int) -> void:
 	game_id = game
 	version = game_version
 	link.peer_connected.connect(_on_peer_connected)
+	link.peer_interrupted.connect(_on_peer_interrupted)
+	link.peer_resumed.connect(_on_peer_resumed)
 	link.peer_disconnected.connect(_on_peer_disconnected)
 	link.received.connect(_on_received)
 	link.connect_failed.connect(_on_connect_failed)
@@ -145,7 +163,7 @@ func can_start(require_ready := false) -> bool:
 	if not is_host or state != "lobby" or members.size() < 2:
 		return false
 	for member in members.values():
-		if not member.synced or (require_ready and not member.ready):
+		if not member.synced or not member.connected or (require_ready and not member.ready):
 			return false
 	return true
 
@@ -230,7 +248,7 @@ func suggested_delay(tick_rate := 120, margin_msec := 12.0, min_ticks := 2, max_
 
 
 func _member(player_name: String, slot: int) -> Dictionary:
-	return {"name": player_name, "slot": slot, "ready": false, "synced": false, "loaded": false, "data": {}, "net": {}}
+	return {"name": player_name, "slot": slot, "ready": false, "synced": false, "loaded": false, "connected": true, "data": {}, "net": {}}
 
 
 func _update_self(values: Dictionary) -> void:
@@ -247,10 +265,10 @@ func _update_self(values: Dictionary) -> void:
 func _go() -> void:
 	state = "started"
 	_broadcast_members()
-	var start_at := Time.get_ticks_usec() + START_DELAY_USEC
-	_send_all({"t": "start", "config": config, "start_at": start_at})
+	_start_at = Time.get_ticks_usec() + START_DELAY_USEC
+	_send_all({"t": "start", "config": config, "start_at": _start_at})
 	link.flush()
-	started.emit(config, start_at)
+	started.emit(config, _start_at)
 
 
 func _start_when_loaded() -> void:
@@ -269,15 +287,40 @@ func _on_peer_connected(id: int) -> void:
 		link.flush()
 
 
-func _on_peer_disconnected(id: int) -> void:
+func _on_peer_interrupted(id: int) -> void:
+	if not is_host:
+		connection_interrupted.emit()
+	elif members.has(id):
+		members[id].connected = false
+		member_interrupted.emit(id)
+		_broadcast_members()
+
+
+func _on_peer_resumed(id: int) -> void:
+	if not is_host:
+		connection_resumed.emit()
+		if state == "joining":
+			_on_peer_connected(id)
+		return
+	if not members.has(id):
+		return
+	members[id].connected = true
+	member_resumed.emit(id)
+	_broadcast_members()
+	# Anything sent while it was away is lost; bring it up to date.
+	_send(id, {"t": "resume", "state": state, "config": config, "start_at": _start_at})
+	link.flush()
+
+
+func _on_peer_disconnected(id: int, reason: String) -> void:
 	if not is_host:
 		if state != "closed":
 			state = "closed"
-			closed.emit("The host left")
+			closed.emit("The host left" if reason == "left" else "Lost connection to the host")
 		return
 	if members.has(id):
 		members.erase(id)
-		member_left.emit(id)
+		member_left.emit(id, reason)
 		_broadcast_members()
 		_start_when_loaded()
 
@@ -310,6 +353,11 @@ func _on_received(id: int, channel: int, bytes: PackedByteArray) -> void:
 func _host_message(id: int, message: Dictionary) -> void:
 	match message.get("t"):
 		"hello":
+			if members.has(id):
+				# Said hello again after reconnecting mid-join.
+				_send(id, {"t": "welcome", "id": id})
+				_broadcast_members()
+				return
 			var reason := ""
 			if message.get("game") != game_id:
 				reason = "Different game"
@@ -349,10 +397,28 @@ func _client_message(message: Dictionary) -> void:
 			link.close()
 			rejected.emit(str(message.get("reason", "Rejected")))
 		"lobby":
+			var before := members
 			members = message.members
 			config = message.config
 			session_name = message.name
+			for id in members:
+				if id != local_id and before.has(id) and before[id].get("connected", true) != members[id].get("connected", true):
+					if members[id].connected:
+						member_resumed.emit(id)
+					else:
+						member_interrupted.emit(id)
 			members_changed.emit()
+		"resume":
+			config = message.config
+			if message.state == "started" and state != "started":
+				state = "started"
+				started.emit(config, host_to_local_usec(message.start_at))
+			elif message.state == "preparing" and state != "preparing":
+				state = "preparing"
+				preparing.emit(config)
+			elif message.state == "lobby" and state in ["preparing", "started"]:
+				state = "lobby"
+				returned.emit()
 		"prepare":
 			config = message.config
 			state = "preparing"

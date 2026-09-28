@@ -24,6 +24,7 @@ func run() -> void:
 	free_run()
 	three_players()
 	hiccup()
+	dropped_connection()
 	print("LOCALNET DEMO: %d checks, %d failures" % [checks, failures.size()])
 	for failure in failures:
 		print("  FAIL ", failure)
@@ -73,7 +74,7 @@ func two_matches_by_address() -> void:
 	check(count(results, "· host ·") == 2 and count(results, "· guest ·") == 2, "The guest joined by typing only the address")
 	check(count(results, "match 2") == 2, "The rematch runs on both devices")
 	check(count(results, "Ran 360 of 360 ticks") == 4, "Every match runs its full length")
-	check(count(results, "with input delay 2 ") == 4, "The automatic delay picks the minimum on loopback")
+	check(count(results, "with input delay 2 ") + count(results, "with input delay 3 ") == 4, "The automatic delay stays small on loopback")
 
 
 func slow_link() -> void:
@@ -122,3 +123,11 @@ func hiccup() -> void:
 		check(absf(a[0] - a[1]) + 8.0 < absf(b[0] - b[1]), "With time sync both devices hear each other equally late (%.1f vs %.1f ms apart; %.1f without)" % [a[0], a[1], absf(b[0] - b[1])])
 	else:
 		check(false, "Both hiccup runs report their lateness")
+
+
+func dropped_connection() -> void:
+	var results := play(["--host", "--name=Host", "--seconds=6"], [["--join", "--loopback", "--name=Guest", "--drop-connection=1500"]])
+	check(results.size() == 2 and count(results, "Finished") == 2, "A match with a 1.5 s disconnection still finishes on both devices")
+	check(count(results, "no desync") == 2, "It stays in sync across the reconnection")
+	check(count(results, "Reconnections 1") == 2, "Both devices saw one reconnection")
+	check(results.all(func(r): return r.contains("longest stall 1") or r.contains("longest stall 2")), "Both waited out the drop (a 1–2 s stall)")

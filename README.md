@@ -9,7 +9,7 @@ The design follows Coldshift Racing's Flutter `net_core` (unicast subnet sweep f
 | Class | Job |
 |---|---|
 | `LocalNetDiscovery` | Hosts answer UDP probes on port 47650, or the first free of 47651–47653 when another host on the same device has it. Scanners probe every address in each local IPv4 /24, plus broadcast where allowed, and list the hosts that reply. A scan can also target one typed address, which finds its game port. |
-| `LocalNetLink` | A thin ENet wrapper with one host, any number of clients and three channels: reliable control, unreliable real-time and reliable events. The game port is chosen by the system or by the host. It can simulate loss, latency and jitter for tests. |
+| `LocalNetLink` | A thin ENet wrapper with one host, any number of clients and three channels: reliable control, unreliable real-time and reliable events. The game port is chosen by the system or by the host. Dropped connections reconnect under the same id (see below). It can simulate loss, latency, jitter, hiccups and dropped connections for tests. |
 | `LocalNetLobby` | Join, reject (wrong game, version or code, or a full lobby), the member list, per-player data, shared settings, ready flags, clock sync, link quality and `suggested_delay()`. It can wait until everyone has loaded before a synchronized start, and returns to the lobby for rematches. |
 | `LocalNetInputSync` | Lockstep input exchange with input delay. Packets resend everything that hasn't been acknowledged, so losses cost nothing. The host relays when there are more than two players. It also offers checksum desync detection, and `predicted_inputs()` as the first building block for rollback. |
 | `LocalNetLockstep` | The per-frame loop: which ticks are due, sampling input ahead, stepping, checksums and freeing old inputs. After a stall it moves its schedule back instead of racing through the backlog, and it reports who it's waiting on. Time sync keeps devices on the same tick after hiccups (see below). |
@@ -70,6 +70,22 @@ INPUTS    ch1 unreliable
 
 Each INPUTS packet repeats every tick the receiver hasn't acknowledged, up to 32 per slot. For two players with 2-byte inputs, a typical packet is 25–30 bytes, plus about 45 bytes of ENet, UDP and IP headers.
 
+## Dropped connections
+
+A connection that drops without a goodbye gets a second chance. Each client sends a random token with its connection request (ENet's 32-bit connect data, so no extra messages). The host holds the client's id for `reconnect_window_msec` (20 s by default) while the client keeps retrying with the token. A client that gets back in time has its old id, so the lobby, input sync and lockstep carry on as if nothing happened. The lockstep side simply waits, then eases back in.
+
+Leaving on purpose (`close()`) or being kicked sends a reason with the disconnect, so it ends at once with no waiting. If the system breaks the socket itself, as phones can when an app is backgrounded, the link opens a new one on the same port and treats every connection as dropped.
+
+| Layer | Signals |
+|---|---|
+| `LocalNetLink` | `peer_interrupted(id)`, `peer_resumed(id)`, `peer_disconnected(id, reason)`, where the reason is "left", "kicked" or "lost". `interrupted_peers()` and `reconnect_seconds_left(id)` support a countdown. |
+| `LocalNetLobby`, everyone | `member_interrupted(id)`, `member_resumed(id)`, `member_left(id, reason)`, and each member's `connected` flag. `can_start()` waits for everyone to be connected. |
+| `LocalNetLobby`, guest | `connection_interrupted`, `connection_resumed`. When the window runs out: `closed("Lost connection to the host")`. |
+
+Anything the host sent while a guest was away is lost, so on resume it resends the member list and settings, and whether a match started, is loading or has ended. A guest that missed the start joins the match on the same clock as everyone else. A guest that comes back after the host has let it go is told so, rather than being let in as a stranger.
+
+The app has to still be running to reconnect: the token lives in memory, so a restarted app joins as a new player.
+
 ## Time sync
 
 During a hiccup every device stalls, but not for the same length of time. Without correction, the one that waited less runs ahead for the rest of the match. That eats into its input delay, so it keeps stuttering. On the A22 and iPhone after a 400 ms hiccup, the iPhone ran 3 ticks ahead, and 93% of the A22's inputs reached it late.
@@ -126,6 +142,7 @@ Command-line options, after `--`:
 | `--loopback` | Scan only this machine |
 | `--drop=0.2`, `--latency=20`, `--jitter=25` | Simulate a bad network |
 | `--hiccup=MS` | Hold this device's packets for MS, three seconds into the match |
+| `--drop-connection=MS` | Drop this device's connection three seconds into the match, and reconnect after MS |
 | `--no-time-sync` | Turn time sync off, for comparison |
 | `--results=DIR` | Where to save results |
 | `--quit` | Quit when done |
@@ -138,8 +155,8 @@ godot --headless --path . -- --join=127.0.0.1 --quit
 ## Tests
 
 ```sh
-godot --headless --path . --script tests/test_localnet.gd   # 139 checks, about 60 s
-godot --headless --path . --script tests/test_demo.gd       # 22 checks, about 90 s
+godot --headless --path . --script tests/test_localnet.gd   # 166 checks, about 90 s
+godot --headless --path . --script tests/test_demo.gd       # 27 checks, about 110 s
 ```
 
 `test_localnet.gd` runs hosts and clients side by side over loopback. A pair of input syncs wired together in memory lets the lockstep rules be checked tick by tick. It covers:
@@ -165,6 +182,13 @@ godot --headless --path . --script tests/test_demo.gd       # 22 checks, about 9
   - time sync, in an event-driven simulation of a 90 fps host and a 60 fps guest: after a hiccup the schedules drift 2 ticks apart without it and stay within a tick with it. It also checks that easing is gentle and that nothing is eased when there's no hiccup;
   - free-run guesses;
   - inputs kept until every peer that needs them has confirmed them.
+- **Dropped connections:**
+  - the guest's drop and the host's;
+  - leaving on purpose, and coming back too late;
+  - the host becoming unreachable;
+  - broken sockets on either side;
+  - a guest catching up on settings and a start it missed;
+  - a lockstep match surviving an 800 ms drop with identical inputs on both sides.
 - **Other:** desync detection, players leaving, and the statistics maths.
 
 `test_demo.gd` launches the link test app as separate host and guest processes and reads the results they save:
@@ -175,6 +199,7 @@ godot --headless --path . --script tests/test_demo.gd       # 22 checks, about 9
 - free-run;
 - three players;
 - a 400 ms hiccup with and without time sync;
+- a 1.5 s dropped connection mid-match;
 - every process quitting on its own.
 
 ## Measurements (2026-09-28)
