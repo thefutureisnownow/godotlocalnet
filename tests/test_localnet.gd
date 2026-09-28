@@ -32,6 +32,7 @@ func run() -> void:
 	lockstep(3, 0.15, 5.0, 5.0, "relayed")
 	stalls()
 	runner_rules()
+	time_sync()
 	free_run()
 	keeps_unconfirmed_inputs()
 	sweep_plan()
@@ -314,26 +315,41 @@ func suggested_delays() -> void:
 	slow.leave()
 
 
+# A link that keeps what it sends, so tests can deliver it by hand.
+class MemoryLink extends LocalNetLink:
+	var outbox := []
+	var round_trip_msec := 0.0
+
+	func rtt_msec(_id: int) -> float:
+		return round_trip_msec
+
+	func send(_id: int, channel: int, bytes: PackedByteArray, _reliable: bool) -> void:
+		outbox.append([channel, bytes])
+
+
 # Two input syncs wired to each other in memory: the test decides when packets arrive
 # and what time it is, so the runner's rules can be checked tick by tick.
 func memory_pair(delay := 2) -> Array:
-	var host_link := LocalNetLink.new()
+	var host_link := MemoryLink.new()
 	host_link.is_host = true
 	var host_sync := LocalNetInputSync.new(host_link, 2, 0, {2: 1}, delay, 1)
-	var guest_sync := LocalNetInputSync.new(LocalNetLink.new(), 2, 1, {1: -1}, delay, 1)
+	var guest_sync := LocalNetInputSync.new(MemoryLink.new(), 2, 1, {1: -1}, delay, 1)
 	return [host_sync, guest_sync]
 
 
+func deliver(from: LocalNetInputSync, to: LocalNetInputSync, from_id: int) -> void:
+	from.flush()
+	for packet in from.link.outbox:
+		to._on_received(from_id, packet[0], packet[1])
+	from.link.outbox.clear()
+
+
 func host_hears(pair: Array) -> void:
-	var packet: PackedByteArray = pair[1]._packet_for(1)
-	if not packet.is_empty():
-		pair[0]._on_received(2, LocalNetLink.CHANNEL_REALTIME, packet)
+	deliver(pair[1], pair[0], 2)
 
 
 func guest_hears(pair: Array) -> void:
-	var packet: PackedByteArray = pair[0]._packet_for(2)
-	if not packet.is_empty():
-		pair[1]._on_received(1, LocalNetLink.CHANNEL_REALTIME, packet)
+	deliver(pair[0], pair[1], 1)
 
 
 func guest_sends(pair: Array, through_tick: int, value := -1) -> void:
@@ -372,6 +388,56 @@ func runner_rules() -> void:
 	check(resumes.size() == 1 and resumes[0] >= 180_000, "Resuming reports how long the stall lasted (%d us)" % (resumes[0] if resumes else 0))
 	check(ran <= runner.slack_ticks + 3, "After a 200 ms stall it eases back in instead of fast-forwarding (%d ticks)" % ran)
 	check(not runner.is_waiting() and runner.waiting_on().is_empty(), "Nobody is waited on once inputs arrive")
+
+
+# A host at 90 fps and a guest at 60, like the A22 and the iPhone, with the host's
+# packets held back 400 ms: both stall, for different lengths, and would drift apart.
+func time_sync() -> void:
+	var without := pair_sim(false, 90, 60, 3000, 400_000, 6.0)
+	var with := pair_sim(true, 90, 60, 3000, 400_000, 6.0)
+	var calm := pair_sim(true, 90, 60, 3000, 0, 6.0)
+	check(without.stalls and without.drift >= 1.5, "Without time sync the host stays ahead after a hiccup (%.2f ticks)" % without.drift)
+	check(with.stalls and absf(with.drift) <= 1.0, "With time sync both are back on the same tick (%.2f)" % with.drift)
+	check(with.eased > 0 and with.most_eased <= 1667, "Easing back takes at most a tenth of any frame (%d us)" % with.most_eased)
+	check(calm.eased == 0 and absf(calm.drift) < 0.5, "Without hiccups time sync leaves the schedule alone (%d us)" % calm.eased)
+
+
+# Two runners on their own frame rates, packets taking [param latency] to arrive and the
+# host's packets held back for [param blackout] after one second, as in a Wi-Fi hiccup.
+# Returns how many ticks the guest's schedule ended up behind the host's (the host's lead).
+func pair_sim(enabled: bool, host_fps: float, guest_fps: float, latency: int, blackout: int, seconds: float) -> Dictionary:
+	var pair := memory_pair(3)
+	var runners := []
+	for side in 2:
+		var runner := LocalNetLockstep.new(pair[side], 0, 120, func(_t): return PackedByteArray([1]), func(_t, _inputs): pass)
+		runner.time_sync = enabled
+		runners.append(runner)
+	# As ENet measures it: both ways across, plus waiting for each side's next poll.
+	for side in 2:
+		pair[side].link.round_trip_msec = (2 * latency + (500_000.0 / host_fps + 500_000.0 / guest_fps)) / 1000.0
+	var next_frame := [1_000_000.0 / host_fps, 1_000_000.0 / guest_fps]
+	var fps := [host_fps, guest_fps]
+	var in_flight := []
+	var ids := [1, 2]
+	var most_eased := 0
+	while minf(next_frame[0], next_frame[1]) < seconds * 1_000_000:
+		var side := 0 if next_frame[0] <= next_frame[1] else 1
+		var now := int(next_frame[side])
+		next_frame[side] += 1_000_000.0 / fps[side]
+		for packet in in_flight.duplicate():
+			if packet.to == side and packet.due <= now:
+				pair[side]._on_received(packet.from, packet.channel, packet.bytes)
+				in_flight.erase(packet)
+		var eased: int = runners[side].eased_usec
+		runners[side].advance(now)
+		most_eased = maxi(most_eased, runners[side].eased_usec - eased)
+		for sent in pair[side].link.outbox:
+			var due := now + latency
+			if side == 0 and now >= 1_000_000 and now < 1_000_000 + blackout:
+				due = 1_000_000 + blackout + latency
+			in_flight.append({"to": 1 - side, "from": ids[side], "channel": sent[0], "bytes": sent[1], "due": due})
+		pair[side].link.outbox.clear()
+	return {"drift": (runners[1].schedule_usec - runners[0].schedule_usec) / runners[0].tick_usec, "stalls": runners.all(func(r): return r.stalled_frames > 0), "eased": runners[0].eased_usec + runners[1].eased_usec, "most_eased": most_eased}
 
 
 func free_run() -> void:

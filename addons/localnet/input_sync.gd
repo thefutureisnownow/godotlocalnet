@@ -8,6 +8,9 @@ extends RefCounted
 ## but a little redundancy. With more than two players the host relays. Confirmed inputs
 ## are kept until [method discard_before], which leaves room to add rollback later.
 ## Pair every [method add_local_input] batch with a [method flush].
+##
+## Every packet also carries the sender's current tick ([member local_tick]), so each
+## device can tell how far ahead of each peer it runs: see [method tick_advantage].
 
 signal remote_input(slot: int, tick: int, arrived_usec: int)
 signal desynced(tick: int, peer_id: int)
@@ -15,12 +18,16 @@ signal desynced(tick: int, peer_id: int)
 const KIND_INPUTS := 10
 const KIND_CHECKSUM := 11
 const MAX_RUN := 32
+## Recent readings of how far ahead of a peer this device was, per peer.
+const ADVANTAGE_SAMPLES := 9
 
 var link: LocalNetLink
 var slot_count: int
 var local_slot: int
 var delay: int
 var input_size: int
+## The tick this device is about to simulate; [LocalNetLockstep] keeps it current.
+var local_tick := 0
 
 var _peer_slots: Dictionary
 var _inputs := []
@@ -31,6 +38,7 @@ var _told := {}
 var _discarded_below := PackedInt32Array()
 var _checksums := {}
 var _remote_checksums := {}
+var _advantage := {}
 
 
 ## [param peer_slots] maps each link peer to the slot it sends: see [method LocalNetLobby.peer_slots].
@@ -55,6 +63,7 @@ func _init(net_link: LocalNetLink, slots: int, own_slot: int, peer_slots: Dictio
 		_acks[id] = _latest.duplicate()
 		_told[id] = _latest.duplicate()
 		_heard[id] = false
+		_advantage[id] = PackedInt32Array()
 	link.received.connect(_on_received)
 
 
@@ -108,6 +117,32 @@ func predicted_inputs(tick: int) -> Array[PackedByteArray]:
 			blank.resize(input_size)
 			result.append(blank)
 	return result
+
+
+## How many ticks ahead of peer [param id] this device was when its recent packets
+## arrived (the median of the last few), not counting the time they spent in flight.
+## Returns 0 with nothing to go on.
+func tick_advantage(id: int) -> float:
+	var samples: PackedInt32Array = _advantage.get(id, PackedInt32Array())
+	if samples.is_empty():
+		return 0.0
+	var sorted := samples.duplicate()
+	sorted.sort()
+	return sorted[sorted.size() >> 1]
+
+
+func advantage_samples(id: int) -> int:
+	return _advantage.get(id, PackedInt32Array()).size()
+
+
+## Forgets the readings, after acting on them.
+func clear_advantage() -> void:
+	for id in _advantage:
+		_advantage[id] = PackedInt32Array()
+
+
+func peers() -> Array:
+	return _peer_slots.keys()
 
 
 ## Sends each peer what it's missing and acknowledges what arrived.
@@ -173,6 +208,7 @@ func _packet_for(id: int) -> PackedByteArray:
 	var buffer := StreamPeerBuffer.new()
 	buffer.put_u8(KIND_INPUTS)
 	buffer.put_u8(slot_count)
+	buffer.put_32(local_tick)
 	for slot in slot_count:
 		buffer.put_32(_latest[slot])
 	buffer.put_u8(runs.size())
@@ -197,11 +233,16 @@ func _on_received(id: int, channel: int, bytes: PackedByteArray) -> void:
 
 
 func _read_inputs(id: int, bytes: PackedByteArray) -> void:
-	if bytes.size() < 2 or bytes[1] != slot_count or bytes.size() < 3 + slot_count * 4:
+	if bytes.size() < 2 or bytes[1] != slot_count or bytes.size() < 7 + slot_count * 4:
 		return
 	var buffer := StreamPeerBuffer.new()
 	buffer.data_array = bytes
 	buffer.seek(2)
+	var samples: PackedInt32Array = _advantage[id]
+	samples.append(local_tick - buffer.get_32())
+	if samples.size() > ADVANTAGE_SAMPLES:
+		samples.remove_at(0)
+	_advantage[id] = samples
 	for slot in slot_count:
 		_acks[id][slot] = maxi(_acks[id][slot], buffer.get_32())
 	_heard[id] = true

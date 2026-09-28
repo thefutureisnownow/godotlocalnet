@@ -23,6 +23,7 @@ func run() -> void:
 	slow_link()
 	free_run()
 	three_players()
+	hiccup()
 	print("LOCALNET DEMO: %d checks, %d failures" % [checks, failures.size()])
 	for failure in failures:
 		print("  FAIL ", failure)
@@ -92,3 +93,32 @@ func three_players() -> void:
 	var results := play(["--host", "--name=Host", "--seconds=3", "--players=3"], [["--join", "--loopback", "--name=One"], ["--join", "--loopback", "--name=Two"]])
 	check(results.size() == 3 and count(results, "Finished") == 3 and count(results, "no desync") == 3, "Three players finish in sync")
 	check(results.all(func(r): return r.contains("slot") and r.split("  from ").size() == 3), "Each device reports both other players separately")
+
+
+# How late, typically, each device heard the other: equal on both sides when their
+# schedules line up, and pulled apart when one runs ahead.
+func typical_lateness(results: Array[String]) -> Array[float]:
+	var found: Array[float] = []
+	var pattern := RegEx.create_from_string("Input lateness over \\d+ inputs \\(ms\\): p50 (-?[0-9.]+)")
+	for r in results:
+		var m := pattern.search(r)
+		if m:
+			found.append(float(m.get_string(1)))
+	return found
+
+
+func hiccup() -> void:
+	var host := ["--host", "--name=Host", "--seconds=8"]
+	var guest := ["--join", "--loopback", "--name=Guest", "--latency=4", "--hiccup=400"]
+	var synced := play(host, [guest])
+	var drifting := play(host + ["--no-time-sync"], [guest + ["--no-time-sync"]])
+	check(synced.size() == 2 and count(synced, "no desync") == 2, "A 400 ms hiccup mid-match still finishes in sync")
+	var eased := synced.filter(func(r): return not r.contains("time sync eased 0 ms"))
+	check(eased.size() >= 1, "Time sync eases a device back after the hiccup")
+	var a := typical_lateness(synced)
+	var b := typical_lateness(drifting)
+	print("HICCUP typical lateness, host and guest: with time sync %s, without %s" % [a, b])
+	if a.size() == 2 and b.size() == 2:
+		check(absf(a[0] - a[1]) + 8.0 < absf(b[0] - b[1]), "With time sync both devices hear each other equally late (%.1f vs %.1f ms apart; %.1f without)" % [a[0], a[1], absf(b[0] - b[1])])
+	else:
+		check(false, "Both hiccup runs report their lateness")

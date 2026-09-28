@@ -12,6 +12,12 @@ extends RefCounted
 ## [member slack_ticks] behind at most. A device that can't keep up slows everyone down
 ## the same way. [member predict] runs on guessed inputs instead of waiting, which
 ## measures the network alone and is where rollback would start.
+##
+## Time sync keeps devices on the same tick at the same moment. Devices wait different
+## amounts during a hiccup, and afterwards the one that waited less would run ahead,
+## eating into its input delay and stuttering. Each packet says which tick its sender was
+## on; allowing for half the round trip, a device more than [member sync_threshold] ticks
+## ahead of any peer eases back, using at most [member sync_rate] of the elapsed time.
 
 signal waiting(slots: Array[int])
 signal resumed(stalled_usec: int)
@@ -27,6 +33,11 @@ var max_ticks_per_frame := 8
 var slack_ticks := 2
 ## Confirmed inputs kept behind the current tick, for replays or rollback.
 var keep_ticks := 240
+var time_sync := true
+var sync_threshold := 1.0
+var sync_rate := 0.1
+## Fresh packets needed from every peer before acting again, so one correction settles first.
+var sync_samples := 5
 
 var sample_input: Callable
 var step: Callable
@@ -39,8 +50,12 @@ var longest_stall_usec := 0
 var total_stall_usec := 0
 var predicted_ticks := 0
 var shifted_usec := 0
+## How much time sync slowed this device down in total.
+var eased_usec := 0
 
 var _stall_since := 0
+var _last_advance_usec := -1
+var _ease_owed := 0
 
 
 ## [param sample] is (tick) -> PackedByteArray, [param simulate] is
@@ -79,6 +94,7 @@ func advance(now := Time.get_ticks_usec()) -> int:
 			if checksum.is_valid() and not predict:
 				sync.report_checksum(tick, checksum.call())
 			sync.discard_before(tick - keep_ticks)
+	sync.local_tick = tick
 	sync.flush()
 	# A frame that stepped some ticks before running out is slow, not frozen.
 	_track_stall(stalled and ran == 0, now)
@@ -87,12 +103,24 @@ func advance(now := Time.get_ticks_usec()) -> int:
 		var shift := ceili((behind - slack_ticks) * tick_usec)
 		schedule_usec += shift
 		shifted_usec += shift
+	if time_sync:
+		_sync_time(now)
 	return ran
 
 
 ## The last tick due by [param now] on the current schedule.
 func due_tick(now := Time.get_ticks_usec()) -> int:
 	return int(floor((now - schedule_usec) / tick_usec))
+
+
+## How many ticks ahead of the slowest peer this device runs right now, allowing for
+## half of each round trip. Negative means behind.
+func advantage() -> float:
+	var worst := -INF
+	for id in sync.peers():
+		if sync.advantage_samples(id) > 0:
+			worst = maxf(worst, sync.tick_advantage(id) - sync.link.rtt_msec(id) * 500.0 / tick_usec)
+	return worst if worst != -INF else 0.0
 
 
 ## When [param at_tick] is due on the current schedule.
@@ -111,6 +139,30 @@ func waiting_on() -> Array[int]:
 		if sync.latest(slot) < tick:
 			slots.append(slot)
 	return slots
+
+
+# Decides how far to ease back once every peer has sent fresh readings, then pays it
+# off a little each frame so the game only ever runs slightly slow.
+func _sync_time(now: int) -> void:
+	var frame := now - _last_advance_usec if _last_advance_usec >= 0 else 0
+	_last_advance_usec = now
+	if _ease_owed > 0:
+		var ease := mini(_ease_owed, int(frame * sync_rate))
+		schedule_usec += ease
+		eased_usec += ease
+		_ease_owed -= ease
+		if _ease_owed > 0:
+			return
+		# Readings taken while easing are out of date.
+		sync.clear_advantage()
+		return
+	for id in sync.peers():
+		if sync.advantage_samples(id) < sync_samples:
+			return
+	var ahead := advantage()
+	if ahead > sync_threshold:
+		_ease_owed = ceili((ahead - 0.5) * tick_usec)
+	sync.clear_advantage()
 
 
 func _track_stall(stalled: bool, now: int) -> void:

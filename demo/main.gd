@@ -5,10 +5,11 @@ extends Control
 #
 # Command-line options (after --): --host, --join[=address[:port]], --name=NAME,
 # --delay=N (default auto), --seconds=N, --players=N, --matches=N, --free, --port=N,
-# --drop=0.1, --latency=MS, --jitter=MS, --loopback, --results=DIR, --quit.
+# --drop=0.1, --latency=MS, --jitter=MS, --hiccup=MS, --no-time-sync, --loopback,
+# --results=DIR, --quit.
 
 const GAME := "localnet-linktest"
-const VERSION := 2
+const VERSION := 3
 const TICK_RATE := 120
 const INPUT_BYTES := 2
 const LANE_WIDTH := 10000
@@ -441,6 +442,7 @@ func begin_test(config: Dictionary, start_usec: int) -> void:
 	sync = LocalNetInputSync.new(lobby.link, players, lobby.local_slot(), lobby.peer_slots(), delay, INPUT_BYTES)
 	runner = LocalNetLockstep.new(sync, start_usec, TICK_RATE, sample_input, simulate, checksum)
 	runner.predict = config.get("mode") == "free-run"
+	runner.time_sync = not options.has("no-time-sync")
 	stats = LocalNetLatencyStats.new(TICK_RATE)
 	slot_stats = {}
 	sync.remote_input.connect(on_remote_input)
@@ -483,6 +485,10 @@ func step_test() -> void:
 	if runner.tick < run.total:
 		runner.max_ticks_per_frame = mini(8, run.total - runner.tick)
 		runner.advance(now)
+		# A simulated Wi-Fi hiccup three seconds in, from this device only.
+		if options.has("hiccup") and not run.has("hiccup") and runner.tick >= 3 * TICK_RATE:
+			run.hiccup = true
+			lobby.link.debug_hold(float(options.hiccup))
 	if canvas:
 		canvas.queue_redraw()
 	if Engine.get_process_frames() % 15 == 0:
@@ -548,7 +554,7 @@ func live_stats(now: int) -> String:
 
 
 func stall_line() -> String:
-	return "Stalled frames %d of %d (%.2f%%) · longest stall %.0f ms · total %.0f ms · schedule moved back %.0f ms" % [runner.stalled_frames, runner.frames, 100.0 * runner.stalled_frames / maxi(runner.frames, 1), runner.longest_stall_usec / 1000.0, runner.total_stall_usec / 1000.0, runner.shifted_usec / 1000.0]
+	return "Stalled frames %d of %d (%.2f%%) · longest stall %.0f ms · total %.0f ms · schedule moved back %.0f ms · time sync eased %.0f ms" % [runner.stalled_frames, runner.frames, 100.0 * runner.stalled_frames / maxi(runner.frames, 1), runner.longest_stall_usec / 1000.0, runner.total_stall_usec / 1000.0, runner.shifted_usec / 1000.0, runner.eased_usec / 1000.0]
 
 
 func slot_name(slot: int) -> String:

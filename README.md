@@ -12,7 +12,7 @@ The design follows Coldshift Racing's Flutter `net_core` (unicast subnet sweep f
 | `LocalNetLink` | A thin ENet wrapper with one host, any number of clients and three channels: reliable control, unreliable real-time and reliable events. The game port is chosen by the system or by the host. It can simulate loss, latency and jitter for tests. |
 | `LocalNetLobby` | Join, reject (wrong game, version or code, or a full lobby), the member list, per-player data, shared settings, ready flags, clock sync, link quality and `suggested_delay()`. It can wait until everyone has loaded before a synchronized start, and returns to the lobby for rematches. |
 | `LocalNetInputSync` | Lockstep input exchange with input delay. Packets resend everything that hasn't been acknowledged, so losses cost nothing. The host relays when there are more than two players. It also offers checksum desync detection, and `predicted_inputs()` as the first building block for rollback. |
-| `LocalNetLockstep` | The per-frame loop: which ticks are due, sampling input ahead, stepping, checksums and freeing old inputs. After a stall it moves its schedule back instead of racing through the backlog, and it reports who it's waiting on. |
+| `LocalNetLockstep` | The per-frame loop: which ticks are due, sampling input ahead, stepping, checksums and freeing old inputs. After a stall it moves its schedule back instead of racing through the backlog, and it reports who it's waiting on. Time sync keeps devices on the same tick after hiccups (see below). |
 | `LocalNetLatencyStats` | Measures how late remote inputs arrive, how often a given input delay would stall, and how deep rollback would need to go. |
 
 Everything is poll-driven `RefCounted` objects, with no autoloads, RPCs or scene-tree multiplayer. Call `poll()` on the discovery and lobby at the start of each frame.
@@ -62,12 +62,26 @@ CHECKSUM  ch2 reliable    [0B][tick: u32][hash: u32]           9 bytes
 
 INPUTS    ch1 unreliable
   [0A][slot_count: u8]
+  [sender_tick: i32]                ← the tick the sender is about to simulate, for time sync
   [latest: i32] × slot_count        ← acks: the highest complete tick held for each slot
   [run_count: u8]
   per run: [slot: u8][first_tick: i32][count: u8][input bytes × count]
 ```
 
-Each INPUTS packet repeats every tick the receiver hasn't acknowledged, up to 32 per slot. For two players with 2-byte inputs, a typical packet is 20–25 bytes, plus about 45 bytes of ENet, UDP and IP headers.
+Each INPUTS packet repeats every tick the receiver hasn't acknowledged, up to 32 per slot. For two players with 2-byte inputs, a typical packet is 25–30 bytes, plus about 45 bytes of ENet, UDP and IP headers.
+
+## Time sync
+
+During a hiccup every device stalls, but not for the same length of time. Without correction, the one that waited less runs ahead for the rest of the match. That eats into its input delay, so it keeps stuttering. On the A22 and iPhone after a 400 ms hiccup, the iPhone ran 3 ticks ahead, and 93% of the A22's inputs reached it late.
+
+Each input packet carries the sender's current tick. A device compares its own tick with the median of a peer's last few, less half the round trip. If it's more than a tick ahead of any peer, it eases back, taking at most 10% of each frame, until they line up.
+
+A 400 ms hiccup over loopback shows the difference:
+
+| | Typical lateness, host / guest | Worst side's stalled frames |
+|---|---|---|
+| Without time sync | 30.7 / −9.9 ms | 13% |
+| With time sync | 14.0 / 7.4 ms | 4% (the hiccup itself) |
 
 ## Ports
 
@@ -111,6 +125,9 @@ Command-line options, after `--`:
 | `--free` | Free-run mode |
 | `--loopback` | Scan only this machine |
 | `--drop=0.2`, `--latency=20`, `--jitter=25` | Simulate a bad network |
+| `--hiccup=MS` | Hold this device's packets for MS, three seconds into the match |
+| `--no-time-sync` | Turn time sync off, for comparison |
+| `--results=DIR` | Where to save results |
 | `--quit` | Quit when done |
 
 ```sh
@@ -121,8 +138,8 @@ godot --headless --path . -- --join=127.0.0.1 --quit
 ## Tests
 
 ```sh
-godot --headless --path . --script tests/test_localnet.gd   # 135 checks, about 60 s
-godot --headless --path . --script tests/test_demo.gd       # 17 checks, about 50 s
+godot --headless --path . --script tests/test_localnet.gd   # 139 checks, about 60 s
+godot --headless --path . --script tests/test_demo.gd       # 22 checks, about 90 s
 ```
 
 `test_localnet.gd` runs hosts and clients side by side over loopback. A pair of input syncs wired together in memory lets the lockstep rules be checked tick by tick. It covers:
@@ -145,6 +162,7 @@ godot --headless --path . --script tests/test_demo.gd       # 17 checks, about 5
   - identical inputs on every device over a clean link, a lossy link (25% loss, 12 ms latency with 10 ms jitter) and a three-player relay;
   - a link far slower than the input delay, where both sides wait and ease back in;
   - stalls counted only when nothing could run, with waiting and resumed signals naming the missing player;
+  - time sync, in an event-driven simulation of a 90 fps host and a 60 fps guest: after a hiccup the schedules drift 2 ticks apart without it and stay within a tick with it. It also checks that easing is gentle and that nothing is eased when there's no hiccup;
   - free-run guesses;
   - inputs kept until every peer that needs them has confirmed them.
 - **Other:** desync detection, players leaving, and the statistics maths.
@@ -156,6 +174,7 @@ godot --headless --path . --script tests/test_demo.gd       # 17 checks, about 5
 - a slow link;
 - free-run;
 - three players;
+- a 400 ms hiccup with and without time sync;
 - every process quitting on its own.
 
 ## Measurements (2026-09-28)

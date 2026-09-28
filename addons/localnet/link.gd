@@ -31,6 +31,7 @@ var _ids := {}
 var _next_id := HOST_ID + 1
 var _delayed := []
 var _last_reliable_due := 0
+var _hold_until := 0
 var _rng := RandomNumberGenerator.new()
 
 
@@ -95,8 +96,9 @@ func poll() -> void:
 func send(id: int, channel: int, bytes: PackedByteArray, reliable: bool) -> void:
 	if not reliable and debug_drop > 0.0 and _rng.randf() < debug_drop:
 		return
-	if debug_latency_msec > 0.0 or debug_jitter_msec > 0.0:
-		var due := Time.get_ticks_usec() + int((debug_latency_msec + _rng.randf() * debug_jitter_msec) * 1000.0)
+	var now := Time.get_ticks_usec()
+	if debug_latency_msec > 0.0 or debug_jitter_msec > 0.0 or now < _hold_until:
+		var due := maxi(now + int((debug_latency_msec + _rng.randf() * debug_jitter_msec) * 1000.0), _hold_until)
 		if reliable:
 			# Jitter must never reorder reliable messages.
 			due = maxi(due, _last_reliable_due + 1)
@@ -104,6 +106,12 @@ func send(id: int, channel: int, bytes: PackedByteArray, reliable: bool) -> void
 		_delayed.append([due, id, channel, bytes, reliable])
 		return
 	_send_now(id, channel, bytes, reliable)
+
+
+## Test impairment: holds every outgoing packet for [param msec], then sends them all,
+## the way a Wi-Fi hiccup does.
+func debug_hold(msec: float) -> void:
+	_hold_until = Time.get_ticks_usec() + int(msec * 1000.0)
 
 
 func broadcast(channel: int, bytes: PackedByteArray, reliable: bool, except_id := 0) -> void:
