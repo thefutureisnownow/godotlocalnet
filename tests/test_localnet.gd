@@ -42,6 +42,7 @@ func run() -> void:
 	reconnects()
 	broken_sockets()
 	lobby_reconnects()
+	reconnect_settings()
 	lockstep_through_drop()
 	desync()
 	departures()
@@ -693,6 +694,71 @@ func lobby_reconnects() -> void:
 	host.link._enet = null
 	pump([guest], 4.0, func(): return closed[0] != "")
 	check(closed[0] == "Lost connection to the host", "A guest that can't get back says so: %s" % closed[0])
+	guest.leave()
+
+
+func joined_pair() -> Array:
+	var host := host_lobby()
+	var guest := join_lobby(host, "Guest")
+	pump([host, guest], 4.0, func(): return host.can_start())
+	return [host, guest]
+
+
+func reconnect_settings() -> void:
+	# The host picks the window and the guest follows it.
+	var pair := joined_pair()
+	var host: LocalNetLobby = pair[0]
+	var guest: LocalNetLobby = pair[1]
+	check(host.reconnect_window_msec == 30_000 and guest.link.reconnect_window_msec == 30_000, "Both sides wait 30 s by default")
+	host.reconnect_window_msec = 5_000
+	pump(pair, 2.0, func(): return guest.reconnect_window_msec == 5_000)
+	check(guest.reconnect_window_msec == 5_000 and guest.link.reconnect_window_msec == 5_000 and host.link.reconnect_window_msec == 5_000, "A window the host sets reaches the guest")
+
+	# Waiting forever: nothing times out until the game gives up, on either side.
+	host.reconnect_window_msec = LocalNetLink.WAIT_FOREVER
+	pump(pair, 2.0, func(): return guest.reconnect_window_msec == LocalNetLink.WAIT_FOREVER)
+	var id := guest.local_id
+	var left := []
+	var closed := [""]
+	host.member_left.connect(func(i, reason): left.append([i, reason]))
+	guest.closed.connect(func(reason): closed[0] = reason)
+	guest.link.debug_drop_connection(LocalNetLink.HOST_ID, 60_000)
+	pump(pair, 1.5)
+	check(host.members.has(id) and not host.members[id].connected and host.link.reconnect_seconds_left(id) == INF, "Waiting forever holds a dropped guest's place with no countdown")
+	host.give_up(id)
+	check(left == [[id, "lost"]] and not host.members.has(id), "The host giving up lets the guest go at once: %s" % [left])
+	check(guest.link.reconnect_seconds_left(LocalNetLink.HOST_ID) == INF and closed[0] == "", "The guest is still waiting for the host")
+	guest.give_up()
+	check(closed[0] == "Lost connection to the host" and guest.link.interrupted_peers().is_empty(), "The guest giving up closes it at once")
+	host.leave()
+	guest.leave()
+
+	# Waiting forever still lets a guest come back.
+	pair = joined_pair()
+	host = pair[0]
+	guest = pair[1]
+	host.reconnect_window_msec = LocalNetLink.WAIT_FOREVER
+	pump(pair, 1.0)
+	guest.link.debug_drop_connection(LocalNetLink.HOST_ID, 2_500)
+	pump(pair, 6.0, func(): return host.members[guest.local_id].connected and guest.link.is_peer_connected(LocalNetLink.HOST_ID))
+	check(host.members[guest.local_id].connected and guest.link.is_peer_connected(LocalNetLink.HOST_ID), "A guest that waits forever comes back after a 2.5 s drop")
+	host.leave()
+	guest.leave()
+
+	# A window of 0 turns reconnecting off: a drop is final straight away.
+	pair = joined_pair()
+	host = pair[0]
+	guest = pair[1]
+	host.reconnect_window_msec = 0
+	pump(pair, 1.0)
+	left = []
+	closed = [""]
+	host.member_left.connect(func(i, reason): left.append([i, reason]))
+	guest.closed.connect(func(reason): closed[0] = reason)
+	guest.link.debug_drop_connection(LocalNetLink.HOST_ID)
+	pump(pair, 2.0, func(): return not left.is_empty())
+	check(left.size() == 1 and left[0][1] == "lost" and closed[0] == "Lost connection to the host", "With no window a drop ends it for both at once: %s, %s" % [left, closed[0]])
+	host.leave()
 	guest.leave()
 
 

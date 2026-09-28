@@ -25,6 +25,7 @@ func run() -> void:
 	three_players()
 	hiccup()
 	dropped_connection()
+	reconnect_window()
 	print("LOCALNET DEMO: %d checks, %d failures" % [checks, failures.size()])
 	for failure in failures:
 		print("  FAIL ", failure)
@@ -131,3 +132,9 @@ func dropped_connection() -> void:
 	check(count(results, "no desync") == 2, "It stays in sync across the reconnection")
 	check(count(results, "Reconnections 1") == 2, "Both devices saw one reconnection")
 	check(results.all(func(r): return r.contains("longest stall 1") or r.contains("longest stall 2")), "Both waited out the drop (a 1–2 s stall)")
+
+
+func reconnect_window() -> void:
+	# A drop longer than the window the host chose ends the match on both devices.
+	var results := play(["--host", "--name=Host", "--seconds=10", "--reconnect=2"], [["--join", "--loopback", "--name=Guest", "--drop-connection=4000"]])
+	check(results.size() == 2 and count(results, "lost their connection") == 1 and count(results, "Lost connection to the host") == 1, "A drop longer than the host's 2 s window ends the match for both")

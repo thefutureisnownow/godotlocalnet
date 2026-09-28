@@ -72,7 +72,7 @@ Each INPUTS packet repeats every tick the receiver hasn't acknowledged, up to 32
 
 ## Dropped connections
 
-A connection that drops without a goodbye gets a second chance. Each client sends a random token with its connection request (ENet's 32-bit connect data, so no extra messages). The host holds the client's id for `reconnect_window_msec` (20 s by default) while the client keeps retrying with the token. A client that gets back in time has its old id, so the lobby, input sync and lockstep carry on as if nothing happened. The lockstep side simply waits, then eases back in.
+A connection that drops without a goodbye gets a second chance. Each client sends a random token with its connection request (ENet's 32-bit connect data, so no extra messages). The host holds the client's id for the reconnect window while the client keeps retrying with the token. A client that gets back in time has its old id, so the lobby, input sync and lockstep carry on as if nothing happened. The lockstep side simply waits, then eases back in.
 
 Leaving on purpose (`close()`) or being kicked sends a reason with the disconnect, so it ends at once with no waiting. If the system breaks the socket itself, as phones can when an app is backgrounded, the link opens a new one on the same port and treats every connection as dropped.
 
@@ -83,6 +83,16 @@ Leaving on purpose (`close()`) or being kicked sends a reason with the disconnec
 | `LocalNetLobby`, guest | `connection_interrupted`, `connection_resumed`. When the window runs out: `closed("Lost connection to the host")`. |
 
 Anything the host sent while a guest was away is lost, so on resume it resends the member list and settings, and whether a match started, is loading or has ended. A guest that missed the start joins the match on the same clock as everyone else. A guest that comes back after the host has let it go is told so, rather than being let in as a stranger.
+
+The game decides how long to wait, and the library only reports what happens:
+
+| Setting or call | Effect |
+|---|---|
+| `lobby.reconnect_window_msec` | Set on the host; guests follow it. 30 s by default. |
+| `0` | Turns reconnecting off: a drop is final at once. |
+| `LocalNetLink.WAIT_FOREVER` | No time limit: waiting lasts until the game gives up. |
+| `lobby.give_up(id)` (host) | Stops waiting for a member, for example from a "stop waiting" button. `member_left(id, "lost")` follows at once. |
+| `lobby.give_up()` (guest) | Stops waiting for the host. `closed(...)` follows at once. |
 
 The app has to still be running to reconnect: the token lives in memory, so a restarted app joins as a new player.
 
@@ -143,6 +153,7 @@ Command-line options, after `--`:
 | `--drop=0.2`, `--latency=20`, `--jitter=25` | Simulate a bad network |
 | `--hiccup=MS` | Hold this device's packets for MS, three seconds into the match |
 | `--drop-connection=MS` | Drop this device's connection three seconds into the match, and reconnect after MS |
+| `--reconnect=SECONDS`, `forever` or `off` | The host's reconnect window (default 30 s). The host screen can also cycle it, and a "Stop waiting" button appears mid-match while someone is reconnecting. |
 | `--no-time-sync` | Turn time sync off, for comparison |
 | `--results=DIR` | Where to save results |
 | `--quit` | Quit when done |
@@ -155,8 +166,8 @@ godot --headless --path . -- --join=127.0.0.1 --quit
 ## Tests
 
 ```sh
-godot --headless --path . --script tests/test_localnet.gd   # 166 checks, about 90 s
-godot --headless --path . --script tests/test_demo.gd       # 27 checks, about 110 s
+godot --headless --path . --script tests/test_localnet.gd   # 180 checks, about 100 s
+godot --headless --path . --script tests/test_demo.gd       # 29 checks, about 130 s
 ```
 
 `test_localnet.gd` runs hosts and clients side by side over loopback. A pair of input syncs wired together in memory lets the lockstep rules be checked tick by tick. It covers:
@@ -188,6 +199,7 @@ godot --headless --path . --script tests/test_demo.gd       # 27 checks, about 1
   - the host becoming unreachable;
   - broken sockets on either side;
   - a guest catching up on settings and a start it missed;
+  - the host's window reaching guests, waiting forever, giving up from either side, and a window of 0;
   - a lockstep match surviving an 800 ms drop with identical inputs on both sides.
 - **Other:** desync detection, players leaving, and the statistics maths.
 
@@ -199,7 +211,7 @@ godot --headless --path . --script tests/test_demo.gd       # 27 checks, about 1
 - free-run;
 - three players;
 - a 400 ms hiccup with and without time sync;
-- a 1.5 s dropped connection mid-match;
+- a 1.5 s dropped connection mid-match, and one longer than the host's window;
 - every process quitting on its own.
 
 ## Measurements (2026-09-28)

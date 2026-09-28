@@ -5,7 +5,7 @@ extends Control
 #
 # Command-line options (after --): --host, --join[=address[:port]], --name=NAME,
 # --delay=N (default auto), --seconds=N, --players=N, --matches=N, --free, --port=N,
-# --drop=0.1, --latency=MS, --jitter=MS, --hiccup=MS, --drop-connection=MS,
+# --reconnect=SECONDS|forever|off, --drop=0.1, --latency=MS, --jitter=MS, --hiccup=MS, --drop-connection=MS,
 # --no-time-sync, --loopback, --results=DIR, --quit.
 
 const GAME := "localnet-linktest"
@@ -29,7 +29,7 @@ var list_box: VBoxContainer
 var name_edit: LineEdit
 var port_edit: LineEdit
 var address_edit: LineEdit
-var settings := {"delay": 3, "auto_delay": true, "seconds": 60, "players": 2, "mode": "lockstep"}
+var settings := {"delay": 3, "auto_delay": true, "seconds": 60, "players": 2, "mode": "lockstep", "reconnect": 30}
 var matches_played := 0
 var joining_address := ""
 var joining_since := 0
@@ -58,6 +58,8 @@ func _ready() -> void:
 		settings.auto_delay = false
 	if options.has("free"):
 		settings.mode = "free-run"
+	if options.has("reconnect"):
+		settings.reconnect = {"forever": -1, "off": 0}.get(options.reconnect, int(options.reconnect))
 	var theme_root := Theme.new()
 	theme_root.default_font_size = 26
 	theme = theme_root
@@ -186,6 +188,7 @@ func start_hosting() -> void:
 		text("Couldn't host on port %d: %s" % [port, error_string(err)])
 		return
 	lobby.set_config(settings)
+	lobby.reconnect_window_msec = reconnect_msec()
 	discovery.advertise(lobby.advert())
 	show_host()
 
@@ -208,6 +211,7 @@ func show_host() -> void:
 	button("Length", cycle_length, tuning)
 	button("Players: %d" % settings.players, cycle_players, tuning).name = "PlayersButton"
 	button("Mode", toggle_mode, tuning)
+	button("Reconnect: " + reconnect_label(), cycle_reconnect, tuning).name = "ReconnectButton"
 	status_label = text("")
 	var actions := row()
 	button("Start test", start_test, actions)
@@ -244,6 +248,21 @@ func cycle_players() -> void:
 func toggle_mode() -> void:
 	settings.mode = "free-run" if settings.mode == "lockstep" else "lockstep"
 	settings_changed()
+
+
+func cycle_reconnect() -> void:
+	var windows := [10, 30, 60, -1, 0]
+	settings.reconnect = windows[(windows.find(settings.reconnect) + 1) % windows.size()]
+	lobby.reconnect_window_msec = reconnect_msec()
+	settings_changed()
+
+
+func reconnect_msec() -> int:
+	return LocalNetLink.WAIT_FOREVER if settings.reconnect < 0 else settings.reconnect * 1000
+
+
+func reconnect_label() -> String:
+	return "forever" if settings.reconnect < 0 else ("off" if settings.reconnect == 0 else "%d s" % settings.reconnect)
 
 
 func cycle_length() -> void:
@@ -290,10 +309,11 @@ func refresh_members() -> void:
 		summary += "\nFree-run never waits: missing inputs repeat the last one, like rollback before it corrects. It measures the network alone."
 	if status_label and is_instance_valid(status_label):
 		status_label.text = summary if lobby.is_host else summary + "\nWaiting for the host to start."
-	for name in ["DelayButton", "PlayersButton"]:
+	var labels := {"DelayButton": "Delay: " + delay_label(), "PlayersButton": "Players: %d" % settings.players, "ReconnectButton": "Reconnect: " + reconnect_label()}
+	for name in labels:
 		var b := box.find_child(name, true, false)
 		if b:
-			b.text = "Delay: " + delay_label() if name == "DelayButton" else "Players: %d" % settings.players
+			b.text = labels[name]
 	if lobby.is_host and options.has("host") and screen == "host" and lobby.can_start() and lobby.members.size() >= settings.players:
 		start_test.call_deferred()
 
@@ -475,7 +495,10 @@ func begin_test(config: Dictionary, start_usec: int) -> void:
 	canvas.draw.connect(draw_lanes)
 	box.add_child(canvas)
 	stats_label = text("")
-	button("Stop", func(): end_test("Stopped on this device"))
+	var actions := row()
+	button("Stop", func(): end_test("Stopped on this device"), actions)
+	# Only while someone is reconnecting: the game, not the library, decides when to stop waiting.
+	button("Stop waiting", give_up_waiting, actions).name = "GiveUpButton"
 
 
 # How late a remote input arrived, measured from when its sender was due to sample it.
@@ -491,6 +514,11 @@ func on_remote_input(slot: int, tick: int, arrived: int) -> void:
 func on_desync(tick: int, _peer: int) -> void:
 	if not run.is_empty() and run.desync_tick < 0:
 		run.desync_tick = tick
+
+
+func give_up_waiting() -> void:
+	for id in lobby.link.interrupted_peers():
+		lobby.give_up(id)
 
 
 func step_test() -> void:
@@ -510,6 +538,9 @@ func step_test() -> void:
 			lobby.link.debug_drop_connection(LocalNetLink.HOST_ID if not lobby.is_host else lobby.link.peers()[0], float(options["drop-connection"]))
 	if canvas:
 		canvas.queue_redraw()
+	var give_up := box.find_child("GiveUpButton", true, false)
+	if give_up:
+		give_up.visible = not lobby.link.interrupted_peers().is_empty()
 	if Engine.get_process_frames() % 15 == 0:
 		stats_label.text = live_stats(now)
 	if runner.tick >= run.total:
@@ -566,7 +597,8 @@ func live_stats(now: int) -> String:
 		waiting = " · waiting for " + ", ".join(runner.waiting_on().map(slot_name))
 	for id in lobby.link.interrupted_peers():
 		var who: String = "the host" if id == LocalNetLink.HOST_ID and not lobby.is_host else lobby.members.get(id, {}).get("name", "a player")
-		waiting += " · lost %s, reconnecting (%.0f s left)" % [who, lobby.link.reconnect_seconds_left(id)]
+		var left := lobby.link.reconnect_seconds_left(id)
+		waiting += " · lost %s, reconnecting (%s)" % [who, "no time limit" if left == INF else "%.0f s left" % left]
 	lines.append("Tick %d / %d · %s%s" % [runner.tick, run.total, "DESYNC at %d" % run.desync_tick if run.desync_tick >= 0 else "in sync", waiting])
 	lines.append(peer_line())
 	lines.append(stall_line())
