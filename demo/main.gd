@@ -3,11 +3,12 @@ extends Control
 # measure how late each other's inputs arrive. The results say which input delay lockstep
 # needs on this network and whether rollback would be worth building.
 #
-# Command-line options (after --): --host, --join[=address], --name=NAME, --delay=N,
-# --seconds=N, --players=N, --drop=0.1, --latency=MS, --jitter=MS, --loopback, --quit.
+# Command-line options (after --): --host, --join[=address[:port]], --name=NAME,
+# --delay=N (default auto), --seconds=N, --players=N, --matches=N, --free, --port=N,
+# --drop=0.1, --latency=MS, --jitter=MS, --loopback, --results=DIR, --quit.
 
 const GAME := "localnet-linktest"
-const VERSION := 1
+const VERSION := 2
 const TICK_RATE := 120
 const INPUT_BYTES := 2
 const LANE_WIDTH := 10000
@@ -15,6 +16,7 @@ const LANE_WIDTH := 10000
 var discovery := LocalNetDiscovery.new(GAME, VERSION)
 var lobby: LocalNetLobby
 var sync: LocalNetInputSync
+var runner: LocalNetLockstep
 var stats: LocalNetLatencyStats
 var slot_stats := {}
 var options := {}
@@ -24,8 +26,12 @@ var box: VBoxContainer
 var status_label: Label
 var list_box: VBoxContainer
 var name_edit: LineEdit
+var port_edit: LineEdit
 var address_edit: LineEdit
-var settings := {"delay": 3, "seconds": 60, "players": 2, "mode": "lockstep"}
+var settings := {"delay": 3, "auto_delay": true, "seconds": 60, "players": 2, "mode": "lockstep"}
+var matches_played := 0
+var joining_address := ""
+var joining_since := 0
 
 # Test run.
 var run := {}
@@ -43,9 +49,12 @@ func _ready() -> void:
 	for arg in OS.get_cmdline_user_args():
 		var parts := arg.trim_prefix("--").split("=", true, 1)
 		options[parts[0]] = parts[1] if parts.size() > 1 else "1"
-	for key in ["delay", "seconds", "players"]:
+	for key in ["seconds", "players"]:
 		if options.has(key):
 			settings[key] = int(options[key])
+	if options.has("delay"):
+		settings.delay = int(options.delay)
+		settings.auto_delay = false
 	if options.has("free"):
 		settings.mode = "free-run"
 	var theme_root := Theme.new()
@@ -69,14 +78,14 @@ func _ready() -> void:
 	elif options.has("join"):
 		show_join()
 		if options.join != "1":
-			connect_to(options.join, int(options.get("port", 0)))
+			join_address(options.join)
 
 
 func _process(_dt: float) -> void:
 	discovery.poll()
 	if lobby:
 		lobby.poll()
-		if lobby and lobby.is_host and screen == "host":
+		if lobby and lobby.is_host and discovery.advertised_port:
 			discovery.update_info(lobby.advert())
 	match screen:
 		"join": refresh_sessions()
@@ -94,7 +103,7 @@ func _input(event: InputEvent) -> void:
 		touch_x = event.position.x
 
 
-# Screens.
+# Building blocks.
 
 func clear() -> void:
 	for child in box.get_children():
@@ -102,9 +111,9 @@ func clear() -> void:
 	canvas = null
 
 
-func heading(text: String) -> void:
+func heading(value: String) -> void:
 	var label := Label.new()
-	label.text = text
+	label.text = value
 	label.add_theme_font_size_override("font_size", 40)
 	box.add_child(label)
 
@@ -133,61 +142,29 @@ func row() -> HBoxContainer:
 	return h
 
 
+func field(placeholder: String, value := "", parent: Control = box) -> LineEdit:
+	var edit := LineEdit.new()
+	edit.placeholder_text = placeholder
+	edit.text = value
+	edit.custom_minimum_size = Vector2(0, 64)
+	edit.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	parent.add_child(edit)
+	return edit
+
+
+# Home.
+
 func show_home() -> void:
 	screen = "home"
 	clear()
 	heading("LocalNet link test")
-	text("Two devices on the same Wi-Fi or hotspot. One hosts, the other joins. No internet needed.")
-	name_edit = LineEdit.new()
-	name_edit.text = options.get("name", OS.get_model_name() if OS.get_model_name() != "GenericDevice" else OS.get_name())
-	name_edit.custom_minimum_size = Vector2(0, 64)
-	box.add_child(name_edit)
+	text("Two devices on the same Wi-Fi or hotspot. One hosts, the others join. No internet needed.")
+	name_edit = field("Your name", options.get("name", OS.get_model_name() if OS.get_model_name() != "GenericDevice" else OS.get_name()))
 	var buttons := row()
-	button("Host", start_hosting, buttons).size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	button("Join", show_join, buttons).size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	port_edit = field("Game port (blank: any free port)", options.get("port", ""), buttons)
+	button("Host", start_hosting, buttons).custom_minimum_size.x = 200
+	button("Join", show_join, buttons).custom_minimum_size.x = 200
 	text("This device: " + describe_addresses())
-
-
-func start_hosting() -> void:
-	leave()
-	lobby = new_lobby()
-	var err := lobby.host(player_name(), settings.players)
-	if err != OK:
-		show_home()
-		text("Couldn't host: %s" % error_string(err))
-		return
-	lobby.set_config(settings)
-	var port := LocalNetDiscovery.PORT
-	if discovery.advertise(lobby.advert(), port) != OK:
-		push_warning("Discovery port busy; guests must join by address")
-	show_host()
-
-
-func show_host() -> void:
-	screen = "host"
-	clear()
-	heading("Hosting")
-	text("Guests on this network will see \"%s\". Or join by address: %s  port %d" % [lobby.session_name, describe_addresses(), lobby.link.port])
-	list_box = VBoxContainer.new()
-	box.add_child(list_box)
-	var tuning := row()
-	button("Delay -", func(): change("delay", -1), tuning)
-	button("Delay +", func(): change("delay", 1), tuning)
-	button("Length", func(): cycle_length(), tuning)
-	button("Players: %d" % settings.players, func(): change("players", 1), tuning).name = "PlayersButton"
-	button("Mode", toggle_mode, tuning)
-	status_label = text("")
-	var actions := row()
-	button("Start test", start_test, actions)
-	button("Back", go_home, actions)
-	lobby.members_changed.connect(refresh_members)
-	lobby.started.connect(begin_test)
-	refresh_members()
-
-
-func start_test() -> void:
-	if lobby.can_start():
-		lobby.start()
 
 
 func go_home() -> void:
@@ -195,35 +172,94 @@ func go_home() -> void:
 	show_home()
 
 
-func show_closed(reason: String) -> void:
-	if screen == "lobby":
-		status_label.text = reason
+# Hosting.
 
-
-func change(key: String, by: int) -> void:
-	if key == "players":
-		settings.players = 2 + (settings.players - 1) % 3
-		lobby.max_players = settings.players
-		var players_button := box.find_child("PlayersButton", true, false)
-		if players_button:
-			players_button.text = "Players: %d" % settings.players
-	else:
-		settings[key] = clampi(settings[key] + by, 0, 16)
+func start_hosting() -> void:
+	player_name()
+	var port := int(port_edit.text) if port_edit and is_instance_valid(port_edit) and port_edit.text.is_valid_int() else 0
+	leave()
+	lobby = new_lobby()
+	var err := lobby.host(player_name(), settings.players, "", port)
+	if err != OK:
+		show_home()
+		text("Couldn't host on port %d: %s" % [port, error_string(err)])
+		return
 	lobby.set_config(settings)
+	discovery.advertise(lobby.advert())
+	show_host()
+
+
+func show_host() -> void:
+	screen = "host"
+	clear()
+	heading("Hosting \"%s\"" % lobby.session_name)
+	var joins := PackedStringArray()
+	for local in LocalNetDiscovery.local_ipv4():
+		joins.append("%s:%d" % [local.address, lobby.link.port])
+	var found_by := "Guests find it automatically (discovery port %d%s)." % [discovery.advertised_port, ", a fallback because another host on this device has %d" % LocalNetDiscovery.PORT if discovery.advertised_port != LocalNetDiscovery.PORT else ""] if discovery.advertised_port else "Discovery isn't available on this device, so guests must type the address."
+	text("%s Or join by typing %s" % [found_by, " or ".join(joins) if not joins.is_empty() else "127.0.0.1:%d" % lobby.link.port])
+	list_box = VBoxContainer.new()
+	box.add_child(list_box)
+	var tuning := row()
+	button("Delay -", func(): change_delay(-1), tuning)
+	button("Delay: auto", toggle_auto_delay, tuning).name = "DelayButton"
+	button("Delay +", func(): change_delay(1), tuning)
+	button("Length", cycle_length, tuning)
+	button("Players: %d" % settings.players, cycle_players, tuning).name = "PlayersButton"
+	button("Mode", toggle_mode, tuning)
+	status_label = text("")
+	var actions := row()
+	button("Start test", start_test, actions)
+	button("Back", go_home, actions)
 	refresh_members()
+
+
+func start_test() -> void:
+	if not lobby.can_start():
+		return
+	if settings.auto_delay:
+		settings.delay = lobby.suggested_delay(TICK_RATE)
+		lobby.set_config(settings)
+	lobby.start()
+
+
+func change_delay(by: int) -> void:
+	settings.auto_delay = false
+	settings.delay = clampi(settings.delay + by, 0, 16)
+	settings_changed()
+
+
+func toggle_auto_delay() -> void:
+	settings.auto_delay = not settings.auto_delay
+	settings_changed()
+
+
+func cycle_players() -> void:
+	settings.players = 2 + (settings.players - 1) % 3
+	lobby.max_players = settings.players
+	settings_changed()
 
 
 func toggle_mode() -> void:
 	settings.mode = "free-run" if settings.mode == "lockstep" else "lockstep"
-	lobby.set_config(settings)
-	refresh_members()
+	settings_changed()
 
 
 func cycle_length() -> void:
 	var lengths := [30, 60, 120, 300]
 	settings.seconds = lengths[(lengths.find(settings.seconds) + 1) % lengths.size()]
+	settings_changed()
+
+
+func settings_changed() -> void:
 	lobby.set_config(settings)
 	refresh_members()
+
+
+func delay_label() -> String:
+	if settings.auto_delay:
+		return "auto (%d)" % lobby.suggested_delay(TICK_RATE)
+	return str(settings.delay)
 
 
 func refresh_members() -> void:
@@ -238,22 +274,30 @@ func refresh_members() -> void:
 		var line := "%s  (slot %d)" % [member.name, member.slot]
 		if id == lobby.local_id:
 			line += "  · you"
-		elif lobby.is_host:
-			line += "  · %d ms" % lobby.link.rtt_msec(id)
+		var net: Dictionary = member.get("net", {})
+		if not net.is_empty():
+			line += "  · ping %.0f ms, 90%% under %.0f ms" % [net.rtt_p50_usec / 1000.0, net.rtt_p90_usec / 1000.0]
 		if not member.synced:
 			line += "  · syncing clock"
 		var label := Label.new()
 		label.text = line
 		list_box.add_child(label)
-	var config := lobby.config if not lobby.config.is_empty() else settings
-	var summary := "%s · input delay %d ticks (%.1f ms) · %d s · up to %d players" % [config.get("mode", "lockstep"), config.get("delay", 3), config.get("delay", 3) * 1000.0 / TICK_RATE, config.get("seconds", 60), config.get("players", 2)]
+	var config := settings if lobby.is_host else lobby.config
+	var delay_text := delay_label() if lobby.is_host else str(config.get("delay", "?"))
+	var summary := "%s · input delay %s · %d s · up to %d players" % [config.get("mode", "lockstep"), delay_text, config.get("seconds", 60), config.get("players", 2)]
 	if config.get("mode") == "free-run":
 		summary += "\nFree-run never waits: missing inputs repeat the last one, like rollback before it corrects. It measures the network alone."
 	if status_label and is_instance_valid(status_label):
 		status_label.text = summary if lobby.is_host else summary + "\nWaiting for the host to start."
-	if lobby.is_host and options.has("host") and lobby.can_start() and lobby.members.size() >= settings.players:
+	for name in ["DelayButton", "PlayersButton"]:
+		var b := box.find_child(name, true, false)
+		if b:
+			b.text = "Delay: " + delay_label() if name == "DelayButton" else "Players: %d" % settings.players
+	if lobby.is_host and options.has("host") and screen == "host" and lobby.can_start() and lobby.members.size() >= settings.players:
 		start_test.call_deferred()
 
+
+# Joining.
 
 func show_join() -> void:
 	player_name()
@@ -265,11 +309,8 @@ func show_join() -> void:
 	list_box = VBoxContainer.new()
 	box.add_child(list_box)
 	var manual := row()
-	address_edit = LineEdit.new()
-	address_edit.placeholder_text = "Host address, e.g. 192.168.43.1:port"
-	address_edit.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	manual.add_child(address_edit)
-	button("Connect", func(): join_typed(), manual)
+	address_edit = field("Host address, with or without :port", "", manual)
+	button("Connect", func(): join_address(address_edit.text), manual)
 	button("Back", go_home)
 	var targets := PackedStringArray(["127.0.0.1"]) if options.has("loopback") else PackedStringArray()
 	discovery.scan(targets)
@@ -277,88 +318,141 @@ func show_join() -> void:
 
 func refresh_sessions() -> void:
 	var sessions := discovery.sessions()
+	if joining_address != "":
+		for session in sessions:
+			if session.address == joining_address and session.compatible:
+				connect_to(session.address, session.port)
+				return
+		if Time.get_ticks_usec() - joining_since > 4_000_000:
+			status_label.text = "No host answered at %s. Check the address, or type the port the host shows." % joining_address
+			joining_address = ""
+		return
 	if list_box.get_child_count() == sessions.size() and Engine.get_process_frames() % 30 != 0:
 		return
 	for child in list_box.get_children():
 		child.queue_free()
 	for session in sessions:
-		var label := "%s  ·  %s  ·  %d/%d  ·  %.0f ms" % [session.name, session.address, session.players, session.max_players, session.ping_ms]
+		var label := "%s  ·  %s:%d  ·  %d/%d  ·  %.0f ms" % [session.name, session.address, session.port, session.players, session.max_players, session.ping_ms]
 		if not session.compatible:
 			label += "  ·  needs v%d" % session.version
+		elif session.state != "lobby":
+			label += "  ·  playing"
 		var b := button(label, func(): connect_to(session.address, session.port), list_box)
 		b.disabled = not session.compatible or session.state != "lobby"
-	status_label.text = ("Looking for hosts…" if sessions.is_empty() else "Tap a host to join.") + "  (sweep: %d addresses, longest frame %.1f ms)" % [discovery.last_sweep_targets, discovery.last_sweep_usec / 1000.0]
+	status_label.text = ("Looking for hosts…" if sessions.is_empty() else "Tap a host to join.") + "  (%d probes a sweep, longest frame %.1f ms)" % [discovery.last_sweep_targets, discovery.last_sweep_usec / 1000.0]
 	if options.has("join") and options.join == "1" and not sessions.is_empty() and sessions[0].compatible:
 		connect_to(sessions[0].address, sessions[0].port)
 
 
-func join_typed() -> void:
-	var parts := address_edit.text.strip_edges().split(":")
-	if parts.size() == 2 and parts[0].is_valid_ip_address():
+## "address:port" connects straight away; a bare address is asked which port it hosts on.
+func join_address(typed: String) -> void:
+	var parts := typed.strip_edges().split(":")
+	if not parts[0].is_valid_ip_address():
+		status_label.text = "Type an address like 192.168.43.1, or 192.168.43.1:51234"
+	elif parts.size() == 2 and parts[1].is_valid_int():
 		connect_to(parts[0], int(parts[1]))
 	else:
-		status_label.text = "Type the address and port the host shows, like 192.168.43.1:51234"
+		joining_address = parts[0]
+		joining_since = Time.get_ticks_usec()
+		discovery.scan(PackedStringArray([joining_address]))
+		status_label.text = "Asking %s…" % joining_address
 
 
 func connect_to(address: String, port: int) -> void:
+	joining_address = ""
 	discovery.stop_scanning()
 	lobby = new_lobby()
 	lobby.join(address, port, player_name())
+	show_guest_lobby("Joining %s:%d" % [address, port], "Connecting…")
+
+
+func show_guest_lobby(title: String, status: String) -> void:
 	screen = "lobby"
 	clear()
-	heading("Joining %s" % address)
+	heading(title)
 	list_box = VBoxContainer.new()
 	box.add_child(list_box)
-	status_label = text("Connecting…")
+	status_label = text(status)
 	button("Leave", go_home)
-	lobby.members_changed.connect(refresh_members)
-	lobby.started.connect(begin_test)
-	lobby.rejected.connect(func(reason): status_label.text = "Turned away: " + reason)
-	lobby.closed.connect(show_closed)
+	refresh_members()
 
+
+# Lobby life cycle, shared by host and guests.
 
 func new_lobby() -> LocalNetLobby:
 	var l := LocalNetLobby.new(GAME, VERSION)
+	l.wait_for_loading = true
 	l.link.debug_drop = float(options.get("drop", 0))
 	l.link.debug_latency_msec = float(options.get("latency", 0))
 	l.link.debug_jitter_msec = float(options.get("jitter", 0))
+	l.members_changed.connect(refresh_members)
+	l.preparing.connect(on_preparing)
+	l.started.connect(begin_test)
+	l.returned.connect(on_returned)
+	l.rejected.connect(func(reason): status_label.text = "Turned away: " + reason)
+	l.closed.connect(on_closed)
+	l.member_left.connect(func(_id): end_test("A player left"))
 	return l
+
+
+func on_preparing(_config: Dictionary) -> void:
+	# A real game loads its stage and fighters here, then reports in.
+	lobby.mark_loaded.call_deferred()
+
+
+func on_returned() -> void:
+	stop_sync()
+	if lobby.is_host:
+		show_host()
+	else:
+		show_guest_lobby("Back in the lobby", "Waiting for the host to start.")
+
+
+func on_closed(reason: String) -> void:
+	if screen == "test":
+		end_test(reason)
+	elif screen == "lobby" and status_label:
+		status_label.text = reason
+	if options.has("quit") and not (lobby and lobby.is_host):
+		quit_soon()
 
 
 func leave() -> void:
 	discovery.stop()
-	if sync:
-		sync.close()
-	sync = null
+	stop_sync()
 	if lobby:
 		lobby.leave()
 	lobby = null
+
+
+func stop_sync() -> void:
+	if sync:
+		sync.close()
+	sync = null
+	runner = null
 	run = {}
 
 
 # The test itself: a deterministic toy where each player slides along a lane.
 
 func begin_test(config: Dictionary, start_usec: int) -> void:
-	discovery.stop()
 	var players := lobby.members.size()
 	var delay := int(config.get("delay", 3))
 	sync = LocalNetInputSync.new(lobby.link, players, lobby.local_slot(), lobby.peer_slots(), delay, INPUT_BYTES)
+	runner = LocalNetLockstep.new(sync, start_usec, TICK_RATE, sample_input, simulate, checksum)
+	runner.predict = config.get("mode") == "free-run"
 	stats = LocalNetLatencyStats.new(TICK_RATE)
 	slot_stats = {}
 	sync.remote_input.connect(on_remote_input)
 	sync.desynced.connect(on_desync)
-	lobby.member_left.connect(func(_id): end_test("A player left"))
-	lobby.closed.connect(end_test)
 	positions.resize(players)
 	for slot in players:
 		positions[slot] = LANE_WIDTH >> 1
 	bot.seed = hash(player_name()) + lobby.local_slot()
-	run = {"start": start_usec, "tick_usec": 1_000_000.0 / TICK_RATE, "tick": 0, "delay": delay, "total": int(config.get("seconds", 60)) * TICK_RATE,
-		"players": players, "stall_frames": 0, "frames": 0, "stall_since": 0, "longest_stall": 0, "stall_time": 0, "catchup_frames": 0,
-		"desync_tick": -1, "checksums": 0, "free": config.get("mode") == "free-run", "predicted": 0, "began_usec": Time.get_ticks_usec(), "config": config}
+	run = {"delay": delay, "total": int(config.get("seconds", 60)) * TICK_RATE, "players": players, "desync_tick": -1, "checksums": 0, "began_usec": Time.get_ticks_usec()}
 	screen = "test"
 	clear()
-	heading("%s · slot %d of %d · delay %d" % [config.get("mode", "lockstep"), lobby.local_slot(), players, delay])
+	heading("%s · slot %d of %d · delay %d (%.0f ms)" % [config.get("mode", "lockstep"), lobby.local_slot(), players, delay, delay * 1000.0 / TICK_RATE])
 	canvas = Control.new()
 	canvas.custom_minimum_size = Vector2(0, 60 * players + 20)
 	canvas.draw.connect(draw_lanes)
@@ -368,13 +462,13 @@ func begin_test(config: Dictionary, start_usec: int) -> void:
 
 
 # How late a remote input arrived, measured from when its sender was due to sample it.
-func on_remote_input(_slot: int, tick: int, arrived: int) -> void:
-	if not run.is_empty():
-		var lateness := int(arrived - (run.start + (tick - run.delay) * run.tick_usec))
+func on_remote_input(slot: int, tick: int, arrived: int) -> void:
+	if runner:
+		var lateness := arrived - runner.scheduled_usec(tick - sync.delay)
 		stats.add(lateness)
-		if not slot_stats.has(_slot):
-			slot_stats[_slot] = LocalNetLatencyStats.new(TICK_RATE)
-		slot_stats[_slot].add(lateness)
+		if not slot_stats.has(slot):
+			slot_stats[slot] = LocalNetLatencyStats.new(TICK_RATE)
+		slot_stats[slot].add(lateness)
 
 
 func on_desync(tick: int, _peer: int) -> void:
@@ -383,51 +477,21 @@ func on_desync(tick: int, _peer: int) -> void:
 
 
 func step_test() -> void:
-	if run.is_empty():
+	if runner == null:
 		return
 	var now := Time.get_ticks_usec()
-	run.frames += 1
-	var due := int(floor((now - run.start) / run.tick_usec))
-	var ran := 0
-	var stalled := false
-	while run.tick <= due and run.tick < run.total and ran < 16:
-		while sync.next_local_tick() <= run.tick + run.delay:
-			sync.add_local_input(sync.next_local_tick(), sample_input())
-		if run.free:
-			if not sync.is_ready(run.tick):
-				run.predicted += 1
-			simulate(sync.predicted_inputs(run.tick))
-		elif sync.is_ready(run.tick):
-			simulate(sync.inputs(run.tick))
-		else:
-			stalled = true
-			break
-		run.tick += 1
-		ran += 1
-		if run.tick % 60 == 0 and not run.free:
-			sync.report_checksum(run.tick, checksum())
-			sync.discard_before(run.tick - 240)
-			run.checksums += 1
-	sync.flush()
-	if ran == 16:
-		run.catchup_frames += 1
-	if stalled:
-		run.stall_frames += 1
-		if run.stall_since == 0:
-			run.stall_since = now
-	elif run.stall_since != 0:
-		run.stall_time += now - run.stall_since
-		run.longest_stall = maxi(run.longest_stall, now - run.stall_since)
-		run.stall_since = 0
+	if runner.tick < run.total:
+		runner.max_ticks_per_frame = mini(8, run.total - runner.tick)
+		runner.advance(now)
 	if canvas:
 		canvas.queue_redraw()
 	if Engine.get_process_frames() % 15 == 0:
 		stats_label.text = live_stats(now)
-	if run.tick >= run.total:
+	if runner.tick >= run.total:
 		end_test("Finished")
 
 
-func sample_input() -> PackedByteArray:
+func sample_input(_tick: int) -> PackedByteArray:
 	var dir := 0
 	if Input.is_key_pressed(KEY_LEFT):
 		dir = -1
@@ -442,7 +506,7 @@ func sample_input() -> PackedByteArray:
 	return PackedByteArray([dir + 1, 1 if touch_x >= 0 else 0])
 
 
-func simulate(inputs: Array[PackedByteArray]) -> void:
+func simulate(_tick: int, inputs: Array[PackedByteArray]) -> void:
 	for slot in inputs.size():
 		var dir: int = inputs[slot][0] - 1
 		positions[slot] = clampi(positions[slot] + dir * 37, 0, LANE_WIDTH)
@@ -451,10 +515,11 @@ func simulate(inputs: Array[PackedByteArray]) -> void:
 
 
 func checksum() -> int:
+	run.checksums += 1
 	var h := 2166136261
 	for value in positions:
 		h = ((h ^ value) * 16777619) & 0xFFFFFFFF
-	return h ^ run.tick
+	return h ^ runner.tick
 
 
 func draw_lanes() -> void:
@@ -471,13 +536,26 @@ func draw_lanes() -> void:
 
 func live_stats(now: int) -> String:
 	var lines := PackedStringArray()
-	var behind: int = int(floor((now - run.start) / run.tick_usec)) - run.tick
-	lines.append("Tick %d / %d · %d behind schedule · %s" % [run.tick, run.total, maxi(behind, 0), "DESYNC at %d" % run.desync_tick if run.desync_tick >= 0 else "in sync"])
+	var waiting := ""
+	if runner.is_waiting():
+		waiting = " · waiting for " + ", ".join(runner.waiting_on().map(slot_name))
+	lines.append("Tick %d / %d · %s%s" % [runner.tick, run.total, "DESYNC at %d" % run.desync_tick if run.desync_tick >= 0 else "in sync", waiting])
 	lines.append(peer_line())
-	lines.append("Stalled frames %d of %d (%.1f%%) · longest stall %.0f ms · total %.0f ms" % [run.stall_frames, run.frames, 100.0 * run.stall_frames / maxi(run.frames, 1), run.longest_stall / 1000.0, run.stall_time / 1000.0])
+	lines.append(stall_line())
 	lines.append(stats.summary())
 	lines.append(per_slot_lines())
 	return "\n".join(lines)
+
+
+func stall_line() -> String:
+	return "Stalled frames %d of %d (%.2f%%) · longest stall %.0f ms · total %.0f ms · schedule moved back %.0f ms" % [runner.stalled_frames, runner.frames, 100.0 * runner.stalled_frames / maxi(runner.frames, 1), runner.longest_stall_usec / 1000.0, runner.total_stall_usec / 1000.0, runner.shifted_usec / 1000.0]
+
+
+func slot_name(slot: int) -> String:
+	for member in lobby.members.values():
+		if member.slot == slot:
+			return member.name
+	return "slot %d" % slot
 
 
 # Each remote player's inputs separately; with three or more players, guests hear each other through the host.
@@ -487,11 +565,7 @@ func per_slot_lines() -> String:
 	slots.sort()
 	for slot in slots:
 		var s: LocalNetLatencyStats = slot_stats[slot]
-		var who := "slot %d" % slot
-		for member in lobby.members.values():
-			if member.slot == slot:
-				who = "%s (slot %d)" % [member.name, slot]
-		lines.append("  from %s: p50 %.1f  p90 %.1f  p99 %.1f  max %.1f ms · late at delay %d: %.1f%%" % [who, s.percentile_msec(50), s.percentile_msec(90), s.percentile_msec(99), s.percentile_msec(100), run.get("delay", 3), s.stall_share(run.get("delay", 3)) * 100])
+		lines.append("  from %s (slot %d): p50 %.1f  p90 %.1f  p99 %.1f  max %.1f ms · late at delay %d: %.1f%%" % [slot_name(slot), slot, s.percentile_msec(50), s.percentile_msec(90), s.percentile_msec(99), s.percentile_msec(100), sync.delay, s.stall_share(sync.delay) * 100])
 	return "\n".join(lines)
 
 
@@ -505,21 +579,20 @@ func peer_line() -> String:
 
 
 func end_test(reason: String) -> void:
-	if screen != "test":
+	if screen != "test" or runner == null:
 		return
 	var now := Time.get_ticks_usec()
-	if run.stall_since != 0:
-		run.stall_time += now - run.stall_since
-		run.longest_stall = maxi(run.longest_stall, now - run.stall_since)
+	runner.finish(now)
+	matches_played += 1
 	var lines := PackedStringArray()
 	lines.append("LOCALNET RESULT · %s" % reason)
-	lines.append("Device: %s (%s %s) · %s · slot %d of %d" % [player_name(), OS.get_name(), OS.get_version(), "host" if lobby.is_host else "guest", lobby.local_slot(), run.players])
+	lines.append("Device: %s (%s %s) · %s · slot %d of %d · match %d" % [player_name(), OS.get_name(), OS.get_version(), "host" if lobby.is_host else "guest", lobby.local_slot(), run.players, matches_played])
 	lines.append("Network: " + describe_addresses())
-	lines.append("Ran %d of %d ticks at %d Hz with input delay %d (%.1f ms) over %.1f s" % [run.tick, run.total, TICK_RATE, run.delay, run.delay * 1000.0 / TICK_RATE, (now - run.began_usec) / 1_000_000.0])
+	lines.append("Ran %d of %d ticks at %d Hz with input delay %d (%.1f ms) over %.1f s" % [runner.tick, run.total, TICK_RATE, sync.delay, sync.delay * 1000.0 / TICK_RATE, (now - run.began_usec) / 1_000_000.0])
 	lines.append(peer_line())
-	lines.append("Stalled frames %d of %d (%.2f%%) · longest stall %.0f ms · total stalled %.0f ms · catch-up frames %d" % [run.stall_frames, run.frames, 100.0 * run.stall_frames / maxi(run.frames, 1), run.longest_stall / 1000.0, run.stall_time / 1000.0, run.catchup_frames])
-	if run.free:
-		lines.append("Free-run: %d of %d ticks ran on a guess (%.1f%%): the share rollback would have had to correct" % [run.predicted, run.tick, 100.0 * run.predicted / maxi(run.tick, 1)])
+	lines.append(stall_line())
+	if runner.predict:
+		lines.append("Free-run: %d of %d ticks ran on a guess (%.1f%%): the share rollback would have had to correct" % [runner.predicted_ticks, runner.tick, 100.0 * runner.predicted_ticks / maxi(runner.tick, 1)])
 	else:
 		lines.append("State checks %d · %s" % [run.checksums, "DESYNC first at tick %d" % run.desync_tick if run.desync_tick >= 0 else "no desync"])
 	lines.append(stats.summary())
@@ -527,23 +600,36 @@ func end_test(reason: String) -> void:
 	result_text = "\n".join(lines)
 	print(result_text)
 	save_result()
-	run = {}
+	runner = null
 	screen = "results"
 	clear()
 	heading("Results")
 	text(result_text)
 	var actions := row()
-	button("Again", go_home, actions)
-	if options.has("quit"):
-		await get_tree().create_timer(1.5).timeout
-		leave()
-		get_tree().quit()
+	if lobby.is_host and lobby.state != "closed":
+		button("Rematch", lobby.return_to_lobby, actions)
+	elif lobby.state != "closed":
+		text("The host can start a rematch.")
+	button("Leave", go_home, actions)
+	if lobby.is_host and options.has("host"):
+		if matches_played < int(options.get("matches", 1)):
+			await get_tree().create_timer(1.5).timeout
+			lobby.return_to_lobby()
+		elif options.has("quit"):
+			quit_soon()
+
+
+func quit_soon() -> void:
+	await get_tree().create_timer(1.5).timeout
+	leave()
+	get_tree().quit()
 
 
 func save_result() -> void:
-	DirAccess.make_dir_recursive_absolute("user://results")
+	var folder: String = options.get("results", "user://results")
+	DirAccess.make_dir_recursive_absolute(folder)
 	var stamp := Time.get_datetime_string_from_system().replace(":", "-")
-	var file := FileAccess.open("user://results/%s-%s.txt" % [stamp, "host" if lobby.is_host else "guest"], FileAccess.WRITE)
+	var file := FileAccess.open(folder.path_join("%s-%s-slot%d-match%d.txt" % [stamp, "host" if lobby.is_host else "guest", lobby.local_slot(), matches_played]), FileAccess.WRITE)
 	if file:
 		file.store_string(result_text + "\n")
 

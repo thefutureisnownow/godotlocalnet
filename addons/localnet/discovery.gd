@@ -7,15 +7,21 @@ extends RefCounted
 ## collects the replies. Unicast sweeping works on phone hotspots and on iOS without
 ## Apple's multicast entitlement; it only needs the local network permission.
 ##
-## Each sweep spreads its probes over short-lived sockets, one per frame. Probes to empty addresses wait
-## in the kernel's ARP queue for seconds, charged to the socket that sent them; on
-## Android a single socket's send buffer fills after a couple of hundred, and Godot's UDP
-## send then blocks the main thread until ARP gives up.
+## Each sweep spreads its probes over short-lived sockets, one per frame. Probes to empty
+## addresses wait in the kernel's ARP queue for seconds, charged to the socket that sent
+## them; on Android a single socket's send buffer fills after a couple of hundred, and
+## Godot's UDP send then blocks the main thread until ARP gives up.
+##
+## When [constant PORT] is taken (a second host on the same device), a host falls back to
+## the next free one of [constant FALLBACK_PORTS]. Scanners probe the fallback ports on this
+## device every sweep and across the network every [constant FALLBACK_SWEEP_EVERY] sweeps.
 ## Call [method poll] every frame.
 
 signal session_found(session: Dictionary)
 
 const PORT := 47650
+const FALLBACK_PORTS := 3
+const FALLBACK_SWEEP_EVERY := 4
 const PROBES_PER_SOCKET := 32
 ## Replies to a sweep are read for this long before its sockets close.
 const SOCKET_LIFETIME_USEC := 4_000_000
@@ -29,9 +35,12 @@ var stale_after := 3.5
 ## Broadcast reaches hosts outside a /24 on Android and desktop. iOS needs an entitlement.
 var use_broadcast := OS.get_name() != "iOS"
 
+## The discovery port this host answers on, 0 when not advertising.
+var advertised_port := 0
+
 var _advertiser: PacketPeerUDP
 var _info := {}
-## The longest a frame of the last sweep took, and how many addresses it probed.
+## The longest a frame of the last sweep took, and how many probes it sent.
 var last_sweep_usec := 0
 var last_sweep_targets := 0
 
@@ -39,6 +48,7 @@ var _scanning := false
 var _pending := []
 var _sockets := []
 var _scan_port := PORT
+var _sweeps := 0
 var _fixed_targets := PackedStringArray()
 var _next_sweep_usec := 0
 var _sessions := {}
@@ -49,11 +59,17 @@ func _init(game: String, game_version: int) -> void:
 	version = game_version
 
 
-## Starts answering probes. [param info] should hold id, name, port, players, max and state.
+## Starts answering probes on [param port], or the first free fallback after it.
+## [param info] should hold id, name, port, players, max and state.
 func advertise(info: Dictionary, port := PORT) -> Error:
 	stop_advertising()
-	_advertiser = PacketPeerUDP.new()
-	var err := _advertiser.bind(port)
+	var err := ERR_UNAVAILABLE
+	for candidate in range(port, port + FALLBACK_PORTS + 1):
+		_advertiser = PacketPeerUDP.new()
+		err = _advertiser.bind(candidate)
+		if err == OK:
+			advertised_port = candidate
+			break
 	if err != OK:
 		_advertiser = null
 		return err
@@ -71,9 +87,11 @@ func stop_advertising() -> void:
 	if _advertiser:
 		_advertiser.close()
 	_advertiser = null
+	advertised_port = 0
 
 
-## Starts sweeping. Leave [param targets] empty to sweep every local /24.
+## Starts sweeping. Leave [param targets] empty to sweep every local /24; given targets
+## (a typed address, say) are probed on every discovery port each sweep.
 func scan(targets := PackedStringArray(), port := PORT) -> Error:
 	stop_scanning()
 	var probe := PacketPeerUDP.new()
@@ -84,6 +102,7 @@ func scan(targets := PackedStringArray(), port := PORT) -> Error:
 	_scanning = true
 	_fixed_targets = targets
 	_scan_port = port
+	_sweeps = 0
 	_next_sweep_usec = 0
 	_sessions.clear()
 	return OK
@@ -158,28 +177,40 @@ static func sweep_targets(broadcast: bool) -> PackedStringArray:
 
 # Queues a sweep; [method _send_chunk] sends one socket's worth per frame.
 func _sweep(_now: int) -> void:
-	var targets := _fixed_targets if not _fixed_targets.is_empty() else sweep_targets(use_broadcast)
+	var fixed := not _fixed_targets.is_empty()
+	var targets := _fixed_targets if fixed else sweep_targets(use_broadcast)
+	var fallbacks := range(_scan_port + 1, _scan_port + FALLBACK_PORTS + 1)
+	var probes := []
+	for address in targets:
+		probes.append([address, _scan_port])
+	# Fallback hosts are nearly always a second host on this very device.
+	var extra := targets if fixed or _sweeps % FALLBACK_SWEEP_EVERY == 0 else PackedStringArray(local_ipv4().map(func(l): return l.address))
+	for address in extra:
+		if not address.ends_with(".255"):
+			for port in fallbacks:
+				probes.append([address, port])
+	_sweeps += 1
 	_pending.clear()
-	for first in range(0, targets.size(), PROBES_PER_SOCKET):
-		_pending.append(targets.slice(first, first + PROBES_PER_SOCKET))
-	last_sweep_targets = targets.size()
+	for first in range(0, probes.size(), PROBES_PER_SOCKET):
+		_pending.append(probes.slice(first, first + PROBES_PER_SOCKET))
+	last_sweep_targets = probes.size()
 	last_sweep_usec = 0
 
 
 func _send_chunk() -> void:
 	var now := Time.get_ticks_usec()
-	var chunk: PackedStringArray = _pending.pop_front()
+	var chunk: Array = _pending.pop_front()
 	var socket := PacketPeerUDP.new()
 	if socket.bind(0) != OK:
 		return
-	for address in chunk:
-		if address.ends_with(".255"):
+	for probe in chunk:
+		if probe[0].ends_with(".255"):
 			socket.set_broadcast_enabled(true)
 			break
-	var probe := _encode({"localnet": "probe", "game": game_id, "v": version, "sent": now})
-	for address in chunk:
-		socket.set_dest_address(address, _scan_port)
-		socket.put_packet(probe)
+	var message := _encode({"localnet": "probe", "game": game_id, "v": version, "sent": now})
+	for probe in chunk:
+		socket.set_dest_address(probe[0], probe[1])
+		socket.put_packet(message)
 	_sockets.append({"socket": socket, "expires": now + SOCKET_LIFETIME_USEC})
 	last_sweep_usec = maxi(last_sweep_usec, Time.get_ticks_usec() - now)
 

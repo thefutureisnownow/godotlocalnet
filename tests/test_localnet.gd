@@ -23,9 +23,21 @@ func run() -> void:
 	lobby_join()
 	lobby_rejects()
 	clock_and_start()
+	ports()
+	typed_messages()
+	loading_and_rematch()
+	suggested_delays()
 	lockstep(2, 0.0, 0.0, 0.0, "clean")
 	lockstep(2, 0.25, 12.0, 10.0, "lossy")
 	lockstep(3, 0.15, 5.0, 5.0, "relayed")
+	stalls()
+	runner_rules()
+	free_run()
+	keeps_unconfirmed_inputs()
+	sweep_plan()
+	stale_sessions()
+	lobby_edges()
+	delay_cap()
 	desync()
 	departures()
 	stats()
@@ -146,16 +158,19 @@ func clock_and_start() -> void:
 	host.leave()
 
 
-# Every player free-runs lockstep; afterwards every device must have seen the same inputs.
-func lockstep(players: int, drop: float, latency: float, jitter: float, label: String) -> void:
+# Every device runs LocalNetLockstep; afterwards every device must have stepped the same inputs.
+func lockstep(players: int, drop: float, latency: float, jitter: float, label: String, delay := 3) -> Array:
 	var host := host_lobby(players)
 	var lobbies: Array[LocalNetLobby] = [host]
 	for i in range(1, players):
 		lobbies.append(join_lobby(host, "Guest %d" % i))
 	pump(lobbies, 5.0, func(): return host.can_start() and lobbies.all(func(l): return l.members.size() == players))
 	check(host.can_start(), "%s: everyone joins" % label)
+	var starts := {}
+	for lobby in lobbies:
+		lobby.started.connect(func(_config, at): starts[lobby] = at)
 	host.start()
-	pump(lobbies, 2.0, func(): return lobbies.all(func(l): return l.state == "started"))
+	pump(lobbies, 2.0, func(): return starts.size() == players)
 	for lobby in lobbies:
 		lobby.link.debug_drop = drop
 		lobby.link.debug_latency_msec = latency
@@ -163,35 +178,309 @@ func lockstep(players: int, drop: float, latency: float, jitter: float, label: S
 	var ticks := 480
 	var runners := []
 	var desyncs := []
+	var most_per_frame := [0]
 	for lobby in lobbies:
-		var sync := LocalNetInputSync.new(lobby.link, players, lobby.local_slot(), lobby.peer_slots(), 3, 2)
-		sync.desynced.connect(func(t, id): desyncs.append(t))
+		var sync := LocalNetInputSync.new(lobby.link, players, lobby.local_slot(), lobby.peer_slots(), delay, 2)
+		sync.desynced.connect(func(t, _id): desyncs.append(t))
 		var rng := RandomNumberGenerator.new()
 		rng.seed = lobby.local_slot() + 11
-		runners.append({"sync": sync, "tick": 0, "history": PackedInt64Array(), "rng": rng})
+		var history := PackedInt64Array()
+		var runner := LocalNetLockstep.new(sync, starts[lobby], 120,
+			func(_t): return PackedByteArray([rng.randi() % 256, rng.randi() % 256]),
+			func(_t, inputs): history.append(hash(inputs)),
+			func(): return history[-1])
+		runners.append({"runner": runner, "history": history})
 	var step := func():
-		for runner in runners:
-			var sync: LocalNetInputSync = runner.sync
-			while sync.next_local_tick() <= runner.tick + sync.delay:
-				sync.add_local_input(sync.next_local_tick(), PackedByteArray([runner.rng.randi() % 256, runner.rng.randi() % 256]))
-			while runner.tick < ticks and sync.is_ready(runner.tick):
-				runner.history.append(hash(sync.inputs(runner.tick)))
-				runner.tick += 1
-				if runner.tick % 60 == 0:
-					sync.report_checksum(runner.tick, runner.history[-1])
-					sync.discard_before(runner.tick - 120)
-			sync.flush()
-		return runners.all(func(r): return r.tick >= ticks)
+		for r in runners:
+			if r.runner.tick < ticks:
+				r.runner.max_ticks_per_frame = mini(8, ticks - r.runner.tick)
+				most_per_frame[0] = maxi(most_per_frame[0], r.runner.advance())
+			else:
+				r.runner.sync.flush()
+		return runners.all(func(r): return r.runner.tick >= ticks)
 	var finished := pump(lobbies, 20.0, step)
 	pump(lobbies, 0.3)
 	check(finished, "%s: all %d players reach tick %d" % [label, players, ticks])
 	var same := runners.all(func(r): return r.history == runners[0].history)
-	check(same, "%s: every device saw identical inputs" % label)
+	check(same, "%s: every device stepped identical inputs" % label)
 	check(desyncs.is_empty(), "%s: checksums agree" % label)
-	for runner in runners:
-		runner.sync.close()
+	check(most_per_frame[0] <= runners[0].runner.slack_ticks + 2, "%s: never races through a backlog (at most %d ticks in a frame)" % [label, most_per_frame[0]])
+	for r in runners:
+		r.runner.sync.close()
 	for lobby in lobbies:
 		lobby.leave()
+	return runners.map(func(r): return r.runner)
+
+
+# A link far slower than the input delay: the game waits, then eases back in rather than fast-forwarding.
+func stalls() -> void:
+	var runners := lockstep(2, 0.0, 45.0, 0.0, "slow link", 1)
+	if runners.size() == 2:
+		check(runners.all(func(r): return r.stalled_frames > 0 and r.shifted_usec > 0), "Slow link: both sides wait and move their schedule back")
+
+
+func ports() -> void:
+	var first := LocalNetDiscovery.new(GAME, 1)
+	var second := LocalNetDiscovery.new(GAME, 1)
+	var a := host_lobby()
+	var b := host_lobby()
+	a.session_name = "First"
+	b.session_name = "Second"
+	check(first.advertise(a.advert(), PORT) == OK and first.advertised_port == PORT, "First host takes the discovery port")
+	check(second.advertise(b.advert(), PORT) == OK and second.advertised_port == PORT + 1, "Second host on the same device falls back to the next port")
+	var scanner := LocalNetDiscovery.new(GAME, 1)
+	scanner.scan(PackedStringArray(["127.0.0.1"]), PORT)
+	pump([first, second, scanner], 2.0, func(): return scanner.sessions().size() == 2)
+	var names := scanner.sessions().map(func(s): return s.name)
+	check(names == ["First", "Second"], "A scan of this device finds both hosts: %s" % [names])
+	for d in [first, second, scanner]:
+		d.stop()
+	a.leave()
+	b.leave()
+	var fixed := LocalNetLobby.new(GAME, 1)
+	check(fixed.host("Fixed", 2, "", 47790) == OK and fixed.link.port == 47790, "A host can choose its game port")
+	var clash := LocalNetLobby.new(GAME, 1)
+	check(clash.host("Clash", 2, "", 47790) != OK, "A taken game port is refused")
+	fixed.leave()
+
+
+func typed_messages() -> void:
+	var host := host_lobby()
+	var client := join_lobby(host, "Guest")
+	pump([host, client], 3.0, func(): return host.members.size() == 2)
+	client.set_data({"fish": 2, "spot": Vector2(1.5, -2)})
+	host.set_config({"stage": 4, "rounds": 3})
+	pump([host, client], 2.0, func(): return client.config.has("stage") and not host.members[client.local_id].data.is_empty())
+	var data: Dictionary = host.members[client.local_id].data
+	check(typeof(data.get("fish")) == TYPE_INT and data.fish == 2, "Numbers stay integers across the wire")
+	check(data.get("spot") == Vector2(1.5, -2), "Vectors survive the wire")
+	check(typeof(client.config.get("stage")) == TYPE_INT, "Settings keep their types")
+	client.leave()
+	host.leave()
+
+
+func loading_and_rematch() -> void:
+	var host := host_lobby()
+	var client := join_lobby(host, "Guest")
+	for l in [host, client]:
+		l.wait_for_loading = true
+	pump([host, client], 4.0, func(): return host.can_start())
+	var events := []
+	for l in [host, client]:
+		var who := "host" if l == host else "guest"
+		l.preparing.connect(func(_c): events.append(who + " prepares"))
+		l.started.connect(func(_c, _at): events.append(who + " starts"))
+		l.returned.connect(func(): events.append(who + " returns"))
+	host.start()
+	pump([host, client], 1.0, func(): return events.size() == 2)
+	check(events.has("host prepares") and events.has("guest prepares") and client.state == "preparing", "Start first asks everyone to load")
+	host.mark_loaded()
+	pump([host, client], 0.5)
+	check(not events.has("host starts"), "Nobody starts while a guest is still loading")
+	client.mark_loaded()
+	pump([host, client], 2.0, func(): return events.has("guest starts"))
+	check(events.has("host starts") and events.has("guest starts"), "Everyone starts once all have loaded")
+	host.return_to_lobby()
+	pump([host, client], 2.0, func(): return events.has("guest returns"))
+	check(client.state == "lobby" and host.state == "lobby" and events.has("guest returns"), "The host brings everyone back for a rematch")
+	check(host.members.values().all(func(m): return not m.ready and not m.loaded), "Ready and loaded flags reset for the rematch")
+	events.clear()
+	host.start()
+	pump([host, client], 1.0, func(): return client.state == "preparing")
+	client.mark_loaded()
+	host.mark_loaded()
+	pump([host, client], 2.0, func(): return events.has("guest starts"))
+	check(events.has("host starts") and events.has("guest starts"), "A rematch starts like the first match")
+	client.leave()
+	host.leave()
+
+
+func suggested_delays() -> void:
+	var quick := host_lobby()
+	var guest := join_lobby(quick, "Guest")
+	pump([quick, guest], 4.0, func(): return quick.can_start())
+	pump([quick, guest], 2.5)
+	check(quick.suggested_delay() == 2 and guest.suggested_delay() == 2, "A quick link gets the minimum delay (%d, %d)" % [quick.suggested_delay(), guest.suggested_delay()])
+	guest.leave()
+	quick.leave()
+	var slow := host_lobby()
+	var far := join_lobby(slow, "Far")
+	for l in [slow, far]:
+		l.link.debug_latency_msec = 40.0
+	pump([slow, far], 6.0, func(): return slow.can_start())
+	pump([slow, far], 2.5)
+	check(slow.suggested_delay() >= 6 and slow.suggested_delay() == far.suggested_delay(), "An 80 ms round trip gets a longer delay, agreed by both (%d, %d)" % [slow.suggested_delay(), far.suggested_delay()])
+	far.leave()
+	slow.leave()
+
+
+# Two input syncs wired to each other in memory: the test decides when packets arrive
+# and what time it is, so the runner's rules can be checked tick by tick.
+func memory_pair(delay := 2) -> Array:
+	var host_link := LocalNetLink.new()
+	host_link.is_host = true
+	var host_sync := LocalNetInputSync.new(host_link, 2, 0, {2: 1}, delay, 1)
+	var guest_sync := LocalNetInputSync.new(LocalNetLink.new(), 2, 1, {1: -1}, delay, 1)
+	return [host_sync, guest_sync]
+
+
+func host_hears(pair: Array) -> void:
+	var packet: PackedByteArray = pair[1]._packet_for(1)
+	if not packet.is_empty():
+		pair[0]._on_received(2, LocalNetLink.CHANNEL_REALTIME, packet)
+
+
+func guest_hears(pair: Array) -> void:
+	var packet: PackedByteArray = pair[0]._packet_for(2)
+	if not packet.is_empty():
+		pair[1]._on_received(1, LocalNetLink.CHANNEL_REALTIME, packet)
+
+
+func guest_sends(pair: Array, through_tick: int, value := -1) -> void:
+	var guest: LocalNetInputSync = pair[1]
+	while guest.next_local_tick() <= through_tick:
+		guest.add_local_input(guest.next_local_tick(), PackedByteArray([value if value >= 0 else guest.next_local_tick() % 256]))
+	host_hears(pair)
+
+
+func runner_rules() -> void:
+	var pair := memory_pair()
+	var tick_usec := 1_000_000.0 / 120
+	var seen := []
+	var runner := LocalNetLockstep.new(pair[0], 0, 120, func(_t): return PackedByteArray([7]), func(_t, inputs): seen.append(inputs[1][0]))
+	var waits := []
+	var resumes := []
+	runner.waiting.connect(func(slots): waits.append(slots))
+	runner.resumed.connect(func(usec): resumes.append(usec))
+	guest_sends(pair, 4)
+	var ran := runner.advance(int(10 * tick_usec))
+	check(ran == 5 and runner.tick == 5, "Runner steps every tick whose inputs are known (%d)" % ran)
+	check(runner.stalled_frames == 0 and waits.is_empty(), "A frame that ran some ticks before running out isn't a stall")
+	check(runner.shifted_usec > 0 and runner.due_tick(int(10 * tick_usec)) - runner.tick <= runner.slack_ticks, "Falling behind moves the schedule back to within the slack")
+	check(seen == [0, 0, 2, 3, 4], "Remote inputs arrive in tick order, after the blank delay ticks")
+	var now := 11 * tick_usec
+	var ran_while_silent := 0
+	for frame in 12:
+		now += 16_667
+		ran_while_silent += runner.advance(int(now))
+	check(ran_while_silent == 0, "Nothing runs while the guest is silent")
+	check(runner.stalled_frames == 12 and runner.is_waiting(), "Frames with nothing to run count as stalled")
+	check(waits.size() == 1 and waits[0] == [1] and runner.waiting_on() == [1], "Waiting is announced once, naming the missing slot")
+	guest_sends(pair, 60)
+	now += 16_667
+	ran = runner.advance(int(now))
+	check(resumes.size() == 1 and resumes[0] >= 180_000, "Resuming reports how long the stall lasted (%d us)" % (resumes[0] if resumes else 0))
+	check(ran <= runner.slack_ticks + 3, "After a 200 ms stall it eases back in instead of fast-forwarding (%d ticks)" % ran)
+	check(not runner.is_waiting() and runner.waiting_on().is_empty(), "Nobody is waited on once inputs arrive")
+
+
+func free_run() -> void:
+	var pair := memory_pair()
+	var seen := []
+	var runner := LocalNetLockstep.new(pair[0], 0, 120, func(_t): return PackedByteArray([7]), func(_t, inputs): seen.append(inputs[1][0]))
+	runner.predict = true
+	guest_sends(pair, 2, 9)
+	runner.advance(int(6 * 1_000_000.0 / 120))
+	check(seen == [0, 0, 9, 9, 9, 9, 9], "Free-run repeats the last known input for missing ticks: %s" % [seen])
+	check(runner.predicted_ticks == 4 and runner.stalled_frames == 0, "Free-run counts its guesses and never stalls")
+	var guesses: Array = pair[0].predicted_inputs(50)
+	check(guesses[0].size() == 1 and guesses[1][0] == 9, "Predicted inputs cover every slot, blank where nothing is known")
+
+
+func keeps_unconfirmed_inputs() -> void:
+	var pair := memory_pair()
+	var host: LocalNetInputSync = pair[0]
+	while host.next_local_tick() <= 100:
+		host.add_local_input(host.next_local_tick(), PackedByteArray([1]))
+	host.discard_before(90)
+	check(host._inputs[0].has(2), "Inputs the other side hasn't confirmed are kept")
+	guest_hears(pair)
+	host_hears(pair)
+	host.discard_before(90)
+	check(not host._inputs[0].has(2) and host._inputs[0].has(95), "Confirmed inputs before the cut-off are freed, later ones kept")
+
+
+func sweep_plan() -> void:
+	var scanner := LocalNetDiscovery.new(GAME, 1)
+	var targets := LocalNetDiscovery.sweep_targets(scanner.use_broadcast)
+	var unicast := Array(targets).filter(func(a): return not a.ends_with(".255")).size()
+	var own := LocalNetDiscovery.local_ipv4().size()
+	scanner._sweep(0)
+	var first: int = scanner.last_sweep_targets
+	scanner._sweep(0)
+	var second: int = scanner.last_sweep_targets
+	check(first == targets.size() + unicast * LocalNetDiscovery.FALLBACK_PORTS, "Every fourth sweep also tries the fallback ports across the network (%d probes)" % first)
+	check(second == targets.size() + own * LocalNetDiscovery.FALLBACK_PORTS, "Other sweeps try the fallback ports on this device only (%d probes)" % second)
+	scanner._pending.clear()
+
+
+func stale_sessions() -> void:
+	var host := host_lobby()
+	var advertiser := LocalNetDiscovery.new(GAME, 1)
+	advertiser.advertise(host.advert(), PORT)
+	var scanner := LocalNetDiscovery.new(GAME, 1)
+	scanner.stale_after = 0.6
+	scanner.sweep_interval = 0.2
+	scanner.scan(PackedStringArray(["127.0.0.1"]), PORT)
+	pump([advertiser, scanner], 2.0, func(): return not scanner.sessions().is_empty())
+	check(scanner.sessions().size() == 1, "The host is listed while it answers")
+	advertiser.stop()
+	pump([scanner], 1.0)
+	check(scanner.sessions().is_empty(), "A host that stops answering drops off the list")
+	scanner.stop()
+	host.leave()
+
+
+func lobby_edges() -> void:
+	var host := host_lobby(3)
+	var stays := join_lobby(host, "Stays")
+	var quits := join_lobby(host, "Quits")
+	var everyone := [host, stays, quits]
+	for l in everyone:
+		l.wait_for_loading = true
+	pump(everyone, 4.0, func(): return host.members.size() == 3 and host.can_start())
+	host.mark_loaded()
+	check(host.state == "lobby", "Marking loaded outside a start does nothing")
+	stays.return_to_lobby()
+	host.return_to_lobby()
+	check(host.state == "lobby" and stays.state == "lobby", "Returning to the lobby from the lobby, or as a guest, does nothing")
+	var nets := []
+	for id in host.members:
+		if id != host.local_id:
+			nets.append(host.members[id].net)
+	check(nets.all(func(n): return n.has("rtt_p50_usec") and n.has("rtt_p90_usec") and n.has("rtt_max_usec")), "Guests report their link quality in the lobby")
+	var starts := []
+	host.started.connect(func(_c, _at): starts.append("host"))
+	stays.started.connect(func(_c, _at): starts.append("stays"))
+	host.start()
+	pump(everyone, 1.0, func(): return stays.state == "preparing")
+	host.mark_loaded()
+	stays.mark_loaded()
+	quits.leave()
+	pump([host, stays], 5.0, func(): return starts.size() == 2)
+	check(starts.size() == 2 and not host.members.has(3), "A player leaving while others load doesn't hold up the start")
+	var net_at_start: Dictionary = host.members[stays.local_id].net.duplicate()
+	pump([host, stays], 2.5)
+	check(host.members[stays.local_id].net == net_at_start, "Link reports stop once the match starts")
+	var late := join_lobby(host, "Late")
+	var reason := [""]
+	late.rejected.connect(func(r): reason[0] = r)
+	pump([host, stays, late], 3.0, func(): return reason[0] != "")
+	check(reason[0] == "Already playing", "Joining mid-match is turned away: %s" % reason[0])
+	for l in [late, stays, host]:
+		l.leave()
+
+
+func delay_cap() -> void:
+	var host := host_lobby()
+	var guest := join_lobby(host, "Distant")
+	for l in [host, guest]:
+		l.link.debug_latency_msec = 150.0
+	pump([host, guest], 8.0, func(): return host.can_start())
+	check(host.suggested_delay() == 12, "A very slow link is capped at 12 ticks (%d)" % host.suggested_delay())
+	check(host.suggested_delay(120, 12.0, 2, 20) > 12 and host.suggested_delay(60) < host.suggested_delay(120), "The cap and tick rate can be changed")
+	guest.leave()
+	host.leave()
 
 
 func desync() -> void:
