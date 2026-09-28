@@ -28,7 +28,7 @@ var _latest := PackedInt32Array()
 var _acks := {}
 var _heard := {}
 var _told := {}
-var _discarded_below := 0
+var _discarded_below := PackedInt32Array()
 var _checksums := {}
 var _remote_checksums := {}
 
@@ -44,6 +44,7 @@ func _init(net_link: LocalNetLink, slots: int, own_slot: int, peer_slots: Dictio
 	var blank := PackedByteArray()
 	blank.resize(input_size)
 	_latest.resize(slot_count)
+	_discarded_below.resize(slot_count)
 	for slot in slot_count:
 		var inputs := {}
 		for tick in delay:
@@ -118,17 +119,24 @@ func flush() -> void:
 	link.flush()
 
 
-## Frees inputs before [param tick] that every peer has confirmed.
+## Frees inputs before [param tick], keeping any a peer still needs from us.
 func discard_before(tick: int) -> void:
-	for id in _acks:
-		for slot in slot_count:
-			tick = mini(tick, _acks[id][slot] + 1)
-	for old in range(_discarded_below, tick):
-		for slot in slot_count:
+	var lowest := tick
+	for slot in slot_count:
+		var limit := tick
+		for id in _acks:
+			if _should_send(id, slot):
+				limit = mini(limit, _acks[id][slot] + 1)
+		for old in range(_discarded_below[slot], limit):
 			_inputs[slot].erase(old)
-		_checksums.erase(old)
-		_remote_checksums.erase(old)
-	_discarded_below = maxi(_discarded_below, tick)
+		_discarded_below[slot] = maxi(_discarded_below[slot], limit)
+		lowest = mini(lowest, limit)
+	for old in _checksums.keys():
+		if old < lowest:
+			_checksums.erase(old)
+	for old in _remote_checksums.keys():
+		if old < lowest:
+			_remote_checksums.erase(old)
 
 
 ## Shares a hash of the game state at [param tick]; a mismatch emits [signal desynced].
