@@ -14,7 +14,9 @@ extends RefCounted
 ## host keeps the client's id for [member reconnect_window_msec] while the client keeps
 ## trying to reconnect with its token. If it gets back in time, both sides emit
 ## [signal peer_resumed] and the client has its old id, so everything built on top
-## carries on. Otherwise both emit [signal peer_disconnected] with reason "lost". Leaving
+## carries on. Otherwise both emit [signal peer_disconnected] with reason "lost". The game
+## chooses the window, may wait forever ([constant WAIT_FOREVER]) and may stop waiting at
+## any moment with [method give_up]. Leaving
 ## on purpose ([method close]) or being kicked ends a connection at once. If the system
 ## breaks the socket itself (as phones can when an app is backgrounded), the link opens a
 ## new one and treats every connection as dropped.
@@ -37,11 +39,15 @@ const HOST_ID := 1
 enum { BYE_NONE, BYE_LEAVE, BYE_KICK, BYE_FORGOTTEN }
 ## Set on a reconnect request's token.
 const RESUMING := 0x80000000
+## A [member reconnect_window_msec] that never runs out; the game ends it with [method give_up].
+const WAIT_FOREVER := -1
+const _NEVER := 1 << 62
 
 var is_host := false
 var port := 0
-## How long a dropped connection may take to come back. 0 turns reconnecting off.
-var reconnect_window_msec := 20_000
+## How long a dropped connection may take to come back: 0 turns reconnecting off and
+## [constant WAIT_FOREVER] waits until [method give_up]. A change applies to later drops.
+var reconnect_window_msec := 30_000
 ## How often a client retries while reconnecting.
 var reconnect_attempt_msec := 1_500
 ## Test impairments: drop a share of unreliable packets, delay every packet.
@@ -123,10 +129,28 @@ func interrupted_peers() -> Array:
 	return [HOST_ID] if _reconnect_until != 0 else []
 
 
-## Seconds left for [param id] to come back, 0 if it isn't interrupted.
+## Seconds left for [param id] to come back: 0 if it isn't interrupted, INF when
+## waiting forever.
 func reconnect_seconds_left(id: int) -> float:
 	var until: int = _reserved[id].until if is_host and _reserved.has(id) else (_reconnect_until if not is_host and id == HOST_ID else 0)
+	if until == _NEVER:
+		return INF
 	return maxf(0.0, (until - Time.get_ticks_usec()) / 1_000_000.0) if until else 0.0
+
+
+## Stops waiting for an interrupted connection: on the host, a client's reserved place;
+## on a client, the host. Emits [signal peer_disconnected] with reason "lost" straight away.
+func give_up(id := HOST_ID) -> void:
+	if is_host and _reserved.has(id):
+		_reserved.erase(id)
+		_forget_token(id)
+		peer_disconnected.emit(id, "lost")
+	elif not is_host and id == HOST_ID and _reconnect_until != 0:
+		_reconnect_until = 0
+		if _connecting:
+			_connecting.reset()
+			_connecting = null
+		peer_disconnected.emit(HOST_ID, "lost")
 
 
 func poll() -> void:
@@ -313,8 +337,8 @@ func _on_disconnect(peer: ENetPacketPeer, data: int) -> void:
 func _lost(id: int, peer: ENetPacketPeer) -> void:
 	_ids.erase(peer)
 	_peers.erase(id)
-	var until := Time.get_ticks_usec() + reconnect_window_msec * 1000
-	if reconnect_window_msec <= 0 or (is_host and _token_of(id) == 0):
+	var until := _NEVER if reconnect_window_msec < 0 else Time.get_ticks_usec() + reconnect_window_msec * 1000
+	if reconnect_window_msec == 0 or (is_host and _token_of(id) == 0):
 		_forget_token(id)
 		peer_disconnected.emit(id, "lost")
 	elif is_host:

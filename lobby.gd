@@ -13,7 +13,9 @@ extends RefCounted
 ## [signal connection_interrupted] and keeps reconnecting. When it's back, everyone gets
 ## [signal member_resumed] and the guest [signal connection_resumed]; the host then
 ## brings it up to date, including a start or return it missed. If the window runs out,
-## the host emits [signal member_left] and the guest [signal closed].
+## the host emits [signal member_left] and the guest [signal closed]. The host sets the
+## window ([member reconnect_window_msec]) and every guest follows it; either side can
+## stop waiting early with [method give_up].
 ##
 ## Control messages are Godot variants ([method @GlobalScope.var_to_bytes], decoded without
 ## objects) over the reliable channel, so numbers and vectors keep their types. Pings are
@@ -60,6 +62,14 @@ var members := {}
 var config := {}
 ## idle, joining, lobby, preparing, started or closed.
 var state := "idle"
+## How long a dropped member may take to reconnect. Set it on the host; guests follow.
+## 0 turns reconnecting off, [constant LocalNetLink.WAIT_FOREVER] waits until [method give_up].
+var reconnect_window_msec := 30_000:
+	set(value):
+		reconnect_window_msec = value
+		link.reconnect_window_msec = value
+		if is_host and state != "idle":
+			_broadcast_members()
 ## When true, [method start] first sends everyone [signal preparing] and waits until
 ## every member calls [method mark_loaded].
 var wait_for_loading := false
@@ -86,6 +96,7 @@ func _init(game: String, game_version: int) -> void:
 	link.peer_disconnected.connect(_on_peer_disconnected)
 	link.received.connect(_on_received)
 	link.connect_failed.connect(_on_connect_failed)
+	link.reconnect_window_msec = reconnect_window_msec
 
 
 ## Opens a lobby. [param port] 0 lets the system pick a free game port.
@@ -186,6 +197,12 @@ func start() -> void:
 	_send_all({"t": "prepare", "config": config})
 	link.flush()
 	preparing.emit(config)
+
+
+## Stops waiting for a dropped connection: the host gives up on member [param id]
+## ([signal member_left] follows); a guest gives up on the host ([signal closed] follows).
+func give_up(id := LocalNetLink.HOST_ID) -> void:
+	link.give_up(id)
 
 
 ## Tells the host this device has loaded the match. See [member wait_for_loading].
@@ -374,7 +391,7 @@ func _host_message(id: int, message: Dictionary) -> void:
 				link.kick(id)
 				return
 			members[id] = _member(str(message.get("name", "Player")).left(24), _free_slot())
-			_send(id, {"t": "welcome", "id": id})
+			_send(id, {"t": "welcome", "id": id, "reconnect_window_msec": reconnect_window_msec})
 			_broadcast_members()
 		"member":
 			if members.has(id):
@@ -390,6 +407,7 @@ func _client_message(message: Dictionary) -> void:
 	match message.get("t"):
 		"welcome":
 			local_id = message.id
+			reconnect_window_msec = message.get("reconnect_window_msec", reconnect_window_msec)
 			state = "lobby"
 			joined.emit(local_id)
 		"reject":
@@ -401,6 +419,7 @@ func _client_message(message: Dictionary) -> void:
 			members = message.members
 			config = message.config
 			session_name = message.name
+			reconnect_window_msec = message.get("reconnect_window_msec", reconnect_window_msec)
 			for id in members:
 				if id != local_id and before.has(id) and before[id].get("connected", true) != members[id].get("connected", true):
 					if members[id].connected:
@@ -476,7 +495,7 @@ func _free_slot() -> int:
 func _broadcast_members() -> void:
 	members_changed.emit()
 	if is_host:
-		_send_all({"t": "lobby", "members": members, "config": config, "name": session_name})
+		_send_all({"t": "lobby", "members": members, "config": config, "name": session_name, "reconnect_window_msec": reconnect_window_msec})
 		link.flush()
 
 
