@@ -25,7 +25,7 @@ Change LocalNet here, never in a game's copy. After the tests pass, bump `addons
 | `LocalNetLink` | A thin ENet wrapper with one host, any number of clients and three channels: reliable control, unreliable real-time and reliable events. The game port is chosen by the system or by the host. Dropped connections reconnect under the same id (see below). It can simulate loss, latency, jitter, hiccups and dropped connections for tests. |
 | `LocalNetLobby` | Join, reject (wrong game, version or code, or a full lobby), the member list, per-player data, shared settings, ready flags, clock sync, link quality and `suggested_delay()`. It can wait until everyone has loaded before a synchronized start, and returns to the lobby for rematches. |
 | `LocalNetInputSync` | Lockstep input exchange with input delay. Packets resend everything that hasn't been acknowledged, so losses cost nothing. The host relays when there are more than two players. It also offers checksum desync detection, and `predicted_inputs()` as the first building block for rollback. |
-| `LocalNetLockstep` | The per-frame loop: which ticks are due, sampling input ahead, stepping, checksums and freeing old inputs. After a stall it moves its schedule back instead of racing through the backlog, and it reports who it's waiting on. Time sync keeps devices on the same tick after hiccups (see below). |
+| `LocalNetLockstep` | The per-frame loop: which ticks are due, sampling input ahead, stepping, checksums and freeing old inputs. After a stall it moves its schedule back instead of racing through the backlog, and it reports who it's waiting on. Time sync keeps devices' schedules together after hiccups or a misjudged clock offset (see below). |
 | `LocalNetLatencyStats` | Measures how late remote inputs arrive, how often a given input delay would stall, and how deep rollback would need to go. |
 
 Everything is poll-driven `RefCounted` objects, with no autoloads, RPCs or scene-tree multiplayer. Call `poll()` on the discovery and lobby at the start of each frame.
@@ -75,13 +75,15 @@ CHECKSUM  ch2 reliable    [0B][tick: u32][hash: u32]           9 bytes
 
 INPUTS    ch1 unreliable
   [0A][slot_count: u8]
-  [sender_tick: i32]                ← the tick the sender is about to simulate, for time sync
+  [position: i32]                   ← where the sender's schedule has reached, in 1/16 ticks
+  [reading: i16]                    ← the sender's reading of how far ahead of the receiver
+                                      it runs, in 1/16 ticks (−32768: none yet), for time sync
   [latest: i32] × slot_count        ← acks: the highest complete tick held for each slot
   [run_count: u8]
   per run: [slot: u8][first_tick: i32][count: u8][input bytes × count]
 ```
 
-Each INPUTS packet repeats every tick the receiver hasn't acknowledged, up to 32 per slot. For two players with 2-byte inputs, a typical packet is 25–30 bytes, plus about 45 bytes of ENet, UDP and IP headers.
+Each INPUTS packet repeats every tick the receiver hasn't acknowledged, up to 32 per slot. For two players with 2-byte inputs, a typical packet is 27–32 bytes, plus about 45 bytes of ENet, UDP and IP headers.
 
 ## Dropped connections
 
@@ -113,7 +115,21 @@ The app has to still be running to reconnect: the token lives in memory, so a re
 
 During a hiccup every device stalls, but not for the same length of time. Without correction, the one that waited less runs ahead for the rest of the match. That eats into its input delay, so it keeps stuttering. On the A22 and iPhone after a 400 ms hiccup, the iPhone ran 3 ticks ahead, and 93% of the A22's inputs reached it late.
 
-Each input packet carries the sender's current tick. A device compares its own tick with the median of a peer's last few, less half the round trip. If it's more than a tick ahead of any peer, it eases back, taking at most 10% of each frame, until they line up.
+The same happens without a hiccup when the clock offset measured at the start is a few milliseconds out. In the phone soak's third match the A25's clock ran about 25 ms ahead of the A22's. It waited on the A22's inputs on 40% of its frames and ran ticks in bursts, which shows as judder.
+
+Each input packet carries where the sender's schedule has reached, in sixteenths of a tick. That's where its clock says it should be, not the tick it has managed to run: waiting holds the tick back, and would hide exactly the lead that causes the waiting. The receiver compares that with its own schedule when the packet arrives, and keeps the median of the last few readings. Each packet also carries the sender's own reading of the receiver, so both halves meet: half the difference between the two readings is how far one schedule runs ahead of the other, and the time the packets spent in flight cancels out. Half of ENet's round trip, the estimate used before, includes both ends' polling and made a two-tick lead look like half a tick. A device more than half a tick ahead of any peer eases back, taking at most 10% of each frame, until they line up.
+
+In a simulation of that third match (a 68 fps host, a 120 fps guest 25 ms ahead, 14.5 ms each way, 4 ticks of delay), the guest waits on 43% of its frames without time sync and 1% with it.
+
+## Input delay
+
+`suggested_delay()` picks an input delay long enough for an input to reach the other device before it's due there. An input can be sampled up to a frame late, since devices only sample on frames, and noticed up to a frame late at the other end. So the delay is:
+
+- half the slowest member's typical (75th-percentile) round trip, which already includes the average quarter of each end's frame;
+- three quarters of the two slowest members' frame times;
+- a 3 ms margin.
+
+Every member times its own frames from how often it polls the lobby, and reports that with its link quality; the host reports its own. Host and guests work the delay out from the same member list, so they agree. On a phone hotspot with a 68 fps and a 120 fps phone it comes to 4 ticks at 120 Hz. The earlier rule, half the 90th-percentile round trip plus a flat 12 ms, gave 3 ticks there, too short for the A22's 15 ms frames, and 5 ticks for a first match whose pings were taken while the lobby was busy.
 
 A 400 ms hiccup over loopback shows the difference:
 
@@ -198,12 +214,12 @@ godot --headless --path . --script tests/test_demo.gd       # 29 checks, about 1
   - waiting for everyone to load, including a player leaving mid-load;
   - rematches;
   - calls made at the wrong time being ignored;
-  - link reports, and suggested delays for quick, slow and very slow links (capped).
+  - link reports and frame times, and suggested delays for quick, slow and very slow links (capped) and for a guest with slow frames, agreed by host and guest.
 - **Lockstep:**
   - identical inputs on every device over a clean link, a lossy link (25% loss, 12 ms latency with 10 ms jitter) and a three-player relay;
   - a link far slower than the input delay, where both sides wait and ease back in;
   - stalls counted only when nothing could run, with waiting and resumed signals naming the missing player;
-  - time sync, in an event-driven simulation of a 90 fps host and a 60 fps guest: after a hiccup the schedules drift 2 ticks apart without it and stay within a tick with it. It also checks that easing is gentle and that nothing is eased when there's no hiccup;
+  - time sync, in an event-driven simulation of a 90 fps host and a 60 fps guest: after a hiccup the schedules drift 2 ticks apart without it and stay within a tick with it. It also checks that easing is gentle and that nothing is eased when there's no hiccup. A second simulation replays the phone soak's clock offset (a 68 fps host and a 120 fps guest 25 ms ahead): the guest waits on most frames without time sync and under 3% with it, with both sides' readings reaching each other;
   - free-run guesses;
   - inputs kept until every peer that needs them has confirmed them.
 - **Dropped connections:**

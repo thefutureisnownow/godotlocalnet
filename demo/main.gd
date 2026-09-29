@@ -9,7 +9,7 @@ extends Control
 # --no-time-sync, --loopback, --results=DIR, --quit.
 
 const GAME := "localnet-linktest"
-const VERSION := 4
+const VERSION := 5
 const TICK_RATE := 120
 const INPUT_BYTES := 2
 const LANE_WIDTH := 10000
@@ -295,8 +295,10 @@ func refresh_members() -> void:
 		if id == lobby.local_id:
 			line += "  · you"
 		var net: Dictionary = member.get("net", {})
-		if not net.is_empty():
+		if net.has("rtt_p50_usec"):
 			line += "  · ping %.0f ms, 90%% under %.0f ms" % [net.rtt_p50_usec / 1000.0, net.rtt_p90_usec / 1000.0]
+		if net.get("frame_usec", 0) > 0:
+			line += "  · %.0f fps" % (1_000_000.0 / net.frame_usec)
 		if not member.synced:
 			line += "  · syncing clock"
 		var label := Label.new()

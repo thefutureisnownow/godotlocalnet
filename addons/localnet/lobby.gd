@@ -5,7 +5,8 @@ extends RefCounted
 ## The host owns the member list, shared settings and the start time. Clients ping the
 ## host several times a second and keep an estimate of the host's clock, so a start time
 ## the host picks becomes the same wall-clock moment on every device. The pings also say
-## how steady each link is, which [method suggested_delay] turns into an input delay.
+## how steady each link is, and every member reports how long its frames take; together
+## [method suggested_delay] turns them into an input delay.
 ##
 ## Dropped connections: when a guest's link drops, the host keeps its place (see
 ## [member LocalNetLink.reconnect_window_msec]), marks it not [code]connected[/code] and
@@ -48,6 +49,12 @@ const CLOCK_SAMPLES := 16
 const LINK_SAMPLES := 40
 ## A client counts as synced after this many pings.
 const SYNCED_AFTER := 5
+## Frames timed for [method frame_usec], and the longest gap still counted as a frame
+## (longer ones are loading or a paused app, not the frame rate).
+const FRAME_SAMPLES := 60
+const LONGEST_FRAME_USEC := 100_000
+## How often the host reports its own frame time while in the lobby.
+const HOST_REPORT_USEC := 1_000_000
 const START_DELAY_USEC := 1_000_000
 
 var link := LocalNetLink.new()
@@ -84,6 +91,9 @@ var _samples := []
 var _round_trips := PackedInt64Array()
 var _next_ping_usec := 0
 var _reported_synced := false
+var _last_poll_usec := 0
+var _frames := PackedInt32Array()
+var _next_host_report_usec := 0
 var _start_at := 0
 
 
@@ -138,7 +148,14 @@ func leave() -> void:
 
 
 func poll() -> void:
+	_time_frame()
 	link.poll()
+	if is_host and state == "lobby" and link.is_open() and Time.get_ticks_usec() >= _next_host_report_usec and not _frames.is_empty():
+		_next_host_report_usec = Time.get_ticks_usec() + HOST_REPORT_USEC
+		var net: Dictionary = members[local_id].net if members.has(local_id) else {}
+		var reported: int = net.get("frame_usec", 0)
+		if not net.has("frame_usec") or absi(frame_usec() - reported) > maxi(1000, reported / 10):
+			_update_self({"net": {"frame_usec": frame_usec()}})
 	if not is_host and state in ["lobby", "preparing", "started"] and link.is_open():
 		var now := Time.get_ticks_usec()
 		if now >= _next_ping_usec:
@@ -250,18 +267,48 @@ func host_to_local_usec(host_usec: int) -> int:
 	return host_usec - clock_offset_usec
 
 
-## An input delay in ticks that covers most of the link's jitter: half the slowest
-## member's 90th-percentile round trip plus [param margin_msec] for frame timing.
-## On a phone hotspot this comes to about 3 ticks at 120 Hz.
-func suggested_delay(tick_rate := 120, margin_msec := 12.0, min_ticks := 2, max_ticks := 12) -> int:
-	var worst := 0
-	if is_host:
-		for member in members.values():
-			worst = maxi(worst, member.get("net", {}).get("rtt_p90_usec", 0))
-	else:
-		worst = _round_trip_percentile(90)
-	var msec := worst / 2000.0 + margin_msec
+## An input delay in ticks long enough for an input to reach the other device before
+## it's due there, from what the members have reported: half the slowest member's typical
+## (75th-percentile) round trip, plus three quarters of the two slowest frame times, plus
+## [param margin_msec]. An input can be sampled up to a frame late, since devices only
+## sample on frames, and noticed up to a frame late at the other end; half the round trip
+## already includes the average quarter of each. Host and guests work it out from the same
+## member list, so they agree. On a phone hotspot this comes to 4 or 5 ticks at 120 Hz.
+func suggested_delay(tick_rate := 120, margin_msec := 3.0, min_ticks := 2, max_ticks := 12) -> int:
+	var round_trip := 0
+	var frames := []
+	for member in members.values():
+		var net: Dictionary = member.get("net", {})
+		round_trip = maxi(round_trip, net.get("rtt_p75_usec", net.get("rtt_p90_usec", 0)))
+		frames.append(net.get("frame_usec", 0))
+	if not is_host:
+		round_trip = maxi(round_trip, _round_trip_percentile(75))
+	# A member that hasn't reported yet counts as a 60 fps device.
+	frames = frames.map(func(f): return f if f > 0 else 16_667)
+	frames.sort()
+	frames.reverse()
+	var slowest_two: int = frames[0] + (frames[1] if frames.size() > 1 else frames[0]) if not frames.is_empty() else 33_333
+	var msec := round_trip / 2000.0 + slowest_two * 0.75 / 1000.0 + margin_msec
 	return clampi(ceili(msec * tick_rate / 1000.0), min_ticks, max_ticks)
+
+
+## How long this device's frames take, in microseconds: the median time between calls to
+## [method poll], which games make once a frame. 0 until measured.
+func frame_usec() -> int:
+	if _frames.is_empty():
+		return 0
+	var sorted := _frames.duplicate()
+	sorted.sort()
+	return sorted[sorted.size() >> 1]
+
+
+func _time_frame() -> void:
+	var now := Time.get_ticks_usec()
+	if _last_poll_usec > 0 and now - _last_poll_usec <= LONGEST_FRAME_USEC:
+		_frames.append(now - _last_poll_usec)
+		if _frames.size() > FRAME_SAMPLES:
+			_frames.remove_at(0)
+	_last_poll_usec = now
 
 
 func _member(player_name: String, slot: int) -> Dictionary:
@@ -473,7 +520,7 @@ func _clock_sample(sent: int, host_time: int, now: int) -> void:
 
 
 func _link_quality() -> Dictionary:
-	return {"rtt_p50_usec": _round_trip_percentile(50), "rtt_p90_usec": _round_trip_percentile(90), "rtt_max_usec": _round_trip_percentile(100)}
+	return {"rtt_p50_usec": _round_trip_percentile(50), "rtt_p75_usec": _round_trip_percentile(75), "rtt_p90_usec": _round_trip_percentile(90), "rtt_max_usec": _round_trip_percentile(100), "frame_usec": frame_usec()}
 
 
 func _round_trip_percentile(p: float) -> int:

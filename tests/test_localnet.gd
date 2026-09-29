@@ -65,6 +65,25 @@ func pump(things: Array, seconds: float, done := func(): return false) -> bool:
 	return false
 
 
+# Like [method pump], but each thing is polled only every [param every_usec] (0 for as
+# often as possible), as a device with that frame time would.
+func pump_frames(things: Array, every_usec: Array, seconds: float, done := func(): return false) -> bool:
+	var until := Time.get_ticks_usec() + int(seconds * 1_000_000)
+	var next := []
+	next.resize(things.size())
+	next.fill(0)
+	while Time.get_ticks_usec() < until:
+		for i in things.size():
+			var now := Time.get_ticks_usec()
+			if now >= next[i]:
+				next[i] = now + every_usec[i]
+				things[i].poll()
+		if done.call():
+			return true
+		OS.delay_usec(500)
+	return false
+
+
 func host_lobby(players := 2, code := "") -> LocalNetLobby:
 	var lobby := LocalNetLobby.new(GAME, 1)
 	check(lobby.host("Host", players, code) == OK, "Host opens a lobby")
@@ -318,6 +337,17 @@ func suggested_delays() -> void:
 	check(slow.suggested_delay() >= 6 and slow.suggested_delay() == far.suggested_delay(), "An 80 ms round trip gets a longer delay, agreed by both (%d, %d)" % [slow.suggested_delay(), far.suggested_delay()])
 	far.leave()
 	slow.leave()
+	# A quick link to a guest drawing a frame every 15 ms, like the A22 in a fight: its
+	# inputs can leave up to a frame late and be noticed up to a frame late.
+	var steady := host_lobby()
+	var jerky := join_lobby(steady, "Jerky")
+	pump_frames([steady, jerky], [0, 15_000], 6.0, func(): return steady.can_start())
+	pump_frames([steady, jerky], [0, 15_000], 3.0)
+	check(jerky.frame_usec() >= 14_000 and jerky.frame_usec() <= 20_000 and steady.frame_usec() < 5_000, "Each lobby times its own frames (%d, %d us)" % [steady.frame_usec(), jerky.frame_usec()])
+	check(steady.members[jerky.local_id].net.get("frame_usec", 0) >= 14_000 and jerky.members[steady.local_id].net.get("frame_usec", -1) >= 0, "Members report their frame times, the host included")
+	check(steady.suggested_delay() >= 3 and steady.suggested_delay() == jerky.suggested_delay(), "Slow frames lengthen the delay, agreed by both (%d, %d)" % [steady.suggested_delay(), jerky.suggested_delay()])
+	jerky.leave()
+	steady.leave()
 
 
 # A link that keeps what it sends, so tests can deliver it by hand.
@@ -405,16 +435,27 @@ func time_sync() -> void:
 	check(with.stalls and absf(with.drift) <= 1.0, "With time sync both are back on the same tick (%.2f)" % with.drift)
 	check(with.eased > 0 and with.most_eased <= 1667, "Easing back takes at most a tenth of any frame (%d us)" % with.most_eased)
 	check(calm.eased == 0 and absf(calm.drift) < 0.5, "Without hiccups time sync leaves the schedule alone (%d us)" % calm.eased)
+	# The phone soak's match 3: a 68 fps host and a 120 fps guest whose clock started 25 ms
+	# ahead. The guest waits on its inputs so often that the ticks it reaches hide the lead;
+	# the schedules' positions, read from both ends, don't.
+	var offset := pair_sim(false, 68, 120, 14_500, 0, 10.0, 25_000, 4)
+	var found := pair_sim(true, 68, 120, 14_500, 0, 10.0, 25_000, 4)
+	var waited := func(result: Dictionary) -> float: return 100.0 * result.runners[1].stalled_frames / result.runners[1].frames
+	check(waited.call(offset) > 30.0, "A guest whose clock runs ahead waits on most frames without time sync (%.0f%%)" % waited.call(offset))
+	check(waited.call(found) < 3.0 and absf(found.drift) < 1.0, "Time sync finds the lead from both sides' readings and removes it (%.1f%% waiting, %.2f ticks apart)" % [waited.call(found), found.drift])
+	check(found.runners[1].sync.clock_lead(1) < 1.0 and not is_nan(found.runners[1].sync.clock_lead(1)), "Each side's reading reaches the other (%.2f)" % found.runners[1].sync.clock_lead(1))
 
 
 # Two runners on their own frame rates, packets taking [param latency] to arrive and the
 # host's packets held back for [param blackout] after one second, as in a Wi-Fi hiccup.
 # Returns how many ticks the guest's schedule ended up behind the host's (the host's lead).
-func pair_sim(enabled: bool, host_fps: float, guest_fps: float, latency: int, blackout: int, seconds: float) -> Dictionary:
-	var pair := memory_pair(3)
+## [param guest_lead] starts the guest's clock that far ahead of the host's, as when clock
+## sync misjudges the offset; [param delay] is the input delay in ticks.
+func pair_sim(enabled: bool, host_fps: float, guest_fps: float, latency: int, blackout: int, seconds: float, guest_lead := 0, delay := 3) -> Dictionary:
+	var pair := memory_pair(delay)
 	var runners := []
 	for side in 2:
-		var runner := LocalNetLockstep.new(pair[side], 0, 120, func(_t): return PackedByteArray([1]), func(_t, _inputs): pass)
+		var runner := LocalNetLockstep.new(pair[side], -guest_lead if side == 1 else 0, 120, func(_t): return PackedByteArray([1]), func(_t, _inputs): pass)
 		runner.time_sync = enabled
 		runners.append(runner)
 	# As ENet measures it: both ways across, plus waiting for each side's next poll.
@@ -425,9 +466,13 @@ func pair_sim(enabled: bool, host_fps: float, guest_fps: float, latency: int, bl
 	var in_flight := []
 	var ids := [1, 2]
 	var most_eased := 0
+	var clock := {"now": 0}
+	for side in 2:
+		pair[side].clock = func(): return clock.now
 	while minf(next_frame[0], next_frame[1]) < seconds * 1_000_000:
 		var side := 0 if next_frame[0] <= next_frame[1] else 1
 		var now := int(next_frame[side])
+		clock.now = now
 		next_frame[side] += 1_000_000.0 / fps[side]
 		for packet in in_flight.duplicate():
 			if packet.to == side and packet.due <= now:
@@ -442,7 +487,7 @@ func pair_sim(enabled: bool, host_fps: float, guest_fps: float, latency: int, bl
 				due = 1_000_000 + blackout + latency
 			in_flight.append({"to": 1 - side, "from": ids[side], "channel": sent[0], "bytes": sent[1], "due": due})
 		pair[side].link.outbox.clear()
-	return {"drift": (runners[1].schedule_usec - runners[0].schedule_usec) / runners[0].tick_usec, "stalls": runners.all(func(r): return r.stalled_frames > 0), "eased": runners[0].eased_usec + runners[1].eased_usec, "most_eased": most_eased}
+	return {"drift": (runners[1].schedule_usec - runners[0].schedule_usec) / runners[0].tick_usec, "stalls": runners.all(func(r): return r.stalled_frames > 0), "eased": runners[0].eased_usec + runners[1].eased_usec, "most_eased": most_eased, "runners": runners}
 
 
 func free_run() -> void:
