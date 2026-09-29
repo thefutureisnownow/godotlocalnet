@@ -323,7 +323,10 @@ func loading_and_rematch() -> void:
 func suggested_delays() -> void:
 	var quick := host_lobby()
 	var guest := join_lobby(quick, "Guest")
+	pump([quick, guest], 0.6)
+	check(guest.state == "lobby" and not quick.can_start(), "A guest can't be started while its radio wakes and its link is measured")
 	pump([quick, guest], 4.0, func(): return quick.can_start())
+	check(quick.members[guest.local_id].net.get("rtt_p75_usec", 0) > 0, "...so once it can, the delay has round trips to go on")
 	pump([quick, guest], 2.5)
 	check(quick.suggested_delay() == 2 and guest.suggested_delay() == 2, "A quick link gets the minimum delay (%d, %d)" % [quick.suggested_delay(), guest.suggested_delay()])
 	# Pings go out about as often as match inputs, but link reports only once a second:

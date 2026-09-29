@@ -57,8 +57,10 @@ const LINK_SAMPLES := 120
 const RADIO_WAKE_USEC := 1_000_000
 ## How often a guest reports its link quality to the host.
 const REPORT_EVERY_USEC := 1_000_000
-## A client counts as synced after this many pings.
+## A client counts as synced, and can be started, once it has this many clock readings and
+## LINK_READY round trips measured after the radio woke: a match can't start on a guess.
 const SYNCED_AFTER := 5
+const LINK_READY := 30
 ## Frames timed for [method frame_usec], and the longest gap still counted as a frame
 ## (longer ones are loading or a paused app, not the frame rate).
 const FRAME_SAMPLES := 60
@@ -526,7 +528,7 @@ func _clock_sample(sent: int, host_time: int, now: int) -> void:
 		_round_trips.append(now - sent)
 		if _round_trips.size() > LINK_SAMPLES:
 			_round_trips.remove_at(0)
-	if not _reported_synced and _samples.size() >= SYNCED_AFTER:
+	if not _reported_synced and _samples.size() >= SYNCED_AFTER and _round_trips.size() >= LINK_READY:
 		_reported_synced = true
 		_next_report_usec = now + REPORT_EVERY_USEC
 		_update_self({"synced": true, "net": _link_quality()})
