@@ -43,12 +43,20 @@ signal returned
 
 const KIND_PING := 1
 const KIND_PONG := 2
-## Guests ping this often in the lobby: often enough for a steady reading within a second or
-## two, and to keep phone radios from napping between pings, which slows the ones that follow.
-const PING_INTERVAL_USEC := 100_000
+## Guests ping this often in the lobby, about as often as a match sends inputs. Phones put
+## a quiet Wi-Fi radio into power save, where packets wait for a beacon or three (100 to
+## 300 ms), and only wake it fully for steady traffic. Pinging four or ten times a second
+## let it nap: the first match was judged from slow pings and still stalled for a second
+## as the radio woke up. At this rate it's awake before the match starts.
+const PING_INTERVAL_USEC := 16_000
 const CLOCK_SAMPLES := 16
-## Round trips kept for judging how steady the link is.
-const LINK_SAMPLES := 40
+## Round trips kept for judging how steady the link is: two seconds' worth.
+const LINK_SAMPLES := 120
+## Round trips in the first moments after joining are left out of that, while the radio
+## wakes up to the pings.
+const RADIO_WAKE_USEC := 1_000_000
+## How often a guest reports its link quality to the host.
+const REPORT_EVERY_USEC := 1_000_000
 ## A client counts as synced after this many pings.
 const SYNCED_AFTER := 5
 ## Frames timed for [method frame_usec], and the longest gap still counted as a frame
@@ -91,6 +99,8 @@ var _join_code_hash := ""
 var _name := ""
 var _samples := []
 var _round_trips := PackedInt64Array()
+var _joined_usec := 0
+var _next_report_usec := 0
 var _next_ping_usec := 0
 var _reported_synced := false
 var _last_poll_usec := 0
@@ -139,6 +149,7 @@ func join(address: String, port: int, player_name: String, join_code := "") -> E
 	_join_code_hash = _hash_code(join_code)
 	_samples.clear()
 	_round_trips.clear()
+	_joined_usec = Time.get_ticks_usec()
 	_reported_synced = false
 	state = "joining"
 	return OK
@@ -511,13 +522,16 @@ func _clock_sample(sent: int, host_time: int, now: int) -> void:
 			best = sample
 	clock_rtt_usec = best[0]
 	clock_offset_usec = best[1]
-	_round_trips.append(now - sent)
-	if _round_trips.size() > LINK_SAMPLES:
-		_round_trips.remove_at(0)
+	if now - _joined_usec >= RADIO_WAKE_USEC:
+		_round_trips.append(now - sent)
+		if _round_trips.size() > LINK_SAMPLES:
+			_round_trips.remove_at(0)
 	if not _reported_synced and _samples.size() >= SYNCED_AFTER:
 		_reported_synced = true
+		_next_report_usec = now + REPORT_EVERY_USEC
 		_update_self({"synced": true, "net": _link_quality()})
-	elif state == "lobby" and _round_trips.size() % 8 == 0:
+	elif state == "lobby" and now >= _next_report_usec:
+		_next_report_usec = now + REPORT_EVERY_USEC
 		_update_self({"net": _link_quality()})
 
 

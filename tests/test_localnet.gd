@@ -326,6 +326,14 @@ func suggested_delays() -> void:
 	pump([quick, guest], 4.0, func(): return quick.can_start())
 	pump([quick, guest], 2.5)
 	check(quick.suggested_delay() == 2 and guest.suggested_delay() == 2, "A quick link gets the minimum delay (%d, %d)" % [quick.suggested_delay(), guest.suggested_delay()])
+	# Pings go out about as often as match inputs, but link reports only once a second:
+	# each one has the host send the member list to everyone.
+	var lists := [0]
+	quick.members_changed.connect(func(): lists[0] += 1)
+	var round_trips := guest._round_trips.size()
+	pump([quick, guest], 3.0)
+	check(guest._round_trips.size() > round_trips + 60 or guest._round_trips.size() == guest.LINK_SAMPLES, "Guests ping many times a second in the lobby")
+	check(lists[0] <= 8, "...but report their link about once a second (%d member lists in 3 s)" % lists[0])
 	guest.leave()
 	quick.leave()
 	var slow := host_lobby()
@@ -593,6 +601,8 @@ func delay_cap() -> void:
 	for l in [host, guest]:
 		l.link.debug_latency_msec = 150.0
 	pump([host, guest], 8.0, func(): return host.can_start())
+	# Round trips count once the first second after joining has passed.
+	pump([host, guest], 2.5)
 	check(host.suggested_delay() == 12, "A very slow link is capped at 12 ticks (%d)" % host.suggested_delay())
 	check(host.suggested_delay(120, 12.0, 2, 20) > 12 and host.suggested_delay(60) < host.suggested_delay(120), "The cap and tick rate can be changed")
 	guest.leave()
