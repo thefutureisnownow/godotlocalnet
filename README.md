@@ -129,7 +129,7 @@ In a simulation of that third match (a 68 fps host, a 120 fps guest 25 ms ahead,
 - three quarters of the two slowest members' frame times;
 - a 3 ms margin.
 
-Every member times its own frames from how often it polls the lobby, and reports that with its link quality; the host reports its own. Host and guests work the delay out from the same member list, so they agree. On a phone hotspot with a 68 fps and a 120 fps phone it comes to 4 ticks at 120 Hz. The earlier rule, half the 90th-percentile round trip plus a flat 12 ms, gave 3 ticks there, too short for the A22's 15 ms frames, and 5 ticks for a first match whose pings were taken while the lobby was busy.
+Guests ping the host ten times a second in the lobby, so a first match has a dozen readings within a couple of seconds of joining, and phone radios don't nap between pings: at four a second, a first match on the A22 and A25 was sometimes judged from a handful of slow pings and got 5 or even 12 ticks, where rematches got 4. Every member times its own frames from how often it polls the lobby, and reports that with its link quality; the host reports its own. Host and guests work the delay out from the same member list, so they agree. On a phone hotspot with a 68 fps and a 120 fps phone it comes to 4 ticks at 120 Hz. The earlier rule, half the 90th-percentile round trip plus a flat 12 ms, gave 3 ticks there, too short for the A22's 15 ms frames, and 5 ticks for a first match whose pings were taken while the lobby was busy.
 
 A 400 ms hiccup over loopback shows the difference:
 
