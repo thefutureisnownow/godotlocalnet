@@ -9,8 +9,10 @@ extends RefCounted
 ## are kept until [method discard_before], which leaves room to add rollback later.
 ## Pair every [method add_local_input] batch with a [method flush].
 ##
-## Every packet also carries the sender's current tick ([member local_tick]), so each
-## device can tell how far ahead of each peer it runs: see [method tick_advantage].
+## Every packet also carries where the sender's schedule has reached ([method position]),
+## so each device can tell how far ahead of each peer it looks ([method tick_advantage]),
+## and that reading of the receiver, so both halves meet: the time packets spend in flight
+## adds to both readings alike and cancels out of [method clock_lead].
 
 signal remote_input(slot: int, tick: int, arrived_usec: int)
 signal desynced(tick: int, peer_id: int)
@@ -20,6 +22,8 @@ const KIND_CHECKSUM := 11
 const MAX_RUN := 32
 ## Recent readings of how far ahead of a peer this device was, per peer.
 const ADVANTAGE_SAMPLES := 9
+## A reading sent as sixteenths of a tick; this value means none yet.
+const NO_READING := -32768
 
 var link: LocalNetLink
 var slot_count: int
@@ -28,6 +32,12 @@ var delay: int
 var input_size: int
 ## The tick this device is about to simulate; [LocalNetLockstep] keeps it current.
 var local_tick := 0
+## The schedule the runner keeps: when tick 0 fell due, and how long a tick lasts.
+## Without one, [method position] falls back to [member local_tick].
+var schedule_usec := 0
+var tick_usec := 0.0
+## () -> int, the time in microseconds; the engine clock unless a test supplies its own.
+var clock := Callable()
 
 var _peer_slots: Dictionary
 var _inputs := []
@@ -39,6 +49,7 @@ var _discarded_below := PackedInt32Array()
 var _checksums := {}
 var _remote_checksums := {}
 var _advantage := {}
+var _their_readings := {}
 
 
 ## [param peer_slots] maps each link peer to the slot it sends: see [method LocalNetLobby.peer_slots].
@@ -119,8 +130,20 @@ func predicted_inputs(tick: int) -> Array[PackedByteArray]:
 	return result
 
 
-## How many ticks ahead of peer [param id] this device was when its recent packets
-## arrived (the median of the last few), not counting the time they spent in flight.
+## Where this device's schedule has reached at [param now], in sixteenths of a tick: a
+## steady clock, unlike the tick it has run, which waiting holds back.
+func position() -> int:
+	if tick_usec <= 0.0:
+		return local_tick * 16
+	return floori((_now() - schedule_usec) * 16.0 / tick_usec)
+
+
+func _now() -> int:
+	return clock.call() if clock.is_valid() else Time.get_ticks_usec()
+
+
+## How many ticks ahead of peer [param id] this device's schedule was when its recent
+## packets arrived (the median of the last few), time in flight included.
 ## Returns 0 with nothing to go on.
 func tick_advantage(id: int) -> float:
 	var samples: PackedInt32Array = _advantage.get(id, PackedInt32Array())
@@ -128,11 +151,21 @@ func tick_advantage(id: int) -> float:
 		return 0.0
 	var sorted := samples.duplicate()
 	sorted.sort()
-	return sorted[sorted.size() >> 1]
+	return sorted[sorted.size() >> 1] / 16.0
 
 
 func advantage_samples(id: int) -> int:
 	return _advantage.get(id, PackedInt32Array()).size()
+
+
+## How far ahead of peer [param id] this device's schedule runs, from both sides' readings:
+## (ours - theirs) / 2, in ticks, which leaves out the time in flight. NAN until the peer
+## has sent a reading.
+func clock_lead(id: int) -> float:
+	var theirs: float = _their_readings.get(id, NAN)
+	if is_nan(theirs) or advantage_samples(id) == 0:
+		return NAN
+	return (tick_advantage(id) - theirs) * 0.5
 
 
 ## Forgets the readings, after acting on them.
@@ -208,7 +241,11 @@ func _packet_for(id: int) -> PackedByteArray:
 	var buffer := StreamPeerBuffer.new()
 	buffer.put_u8(KIND_INPUTS)
 	buffer.put_u8(slot_count)
-	buffer.put_32(local_tick)
+	buffer.put_32(position())
+	var reading := NO_READING
+	if advantage_samples(id) > 0:
+		reading = clampi(roundi(tick_advantage(id) * 16.0), -32767, 32767)
+	buffer.put_16(reading)
 	for slot in slot_count:
 		buffer.put_32(_latest[slot])
 	buffer.put_u8(runs.size())
@@ -233,20 +270,24 @@ func _on_received(id: int, channel: int, bytes: PackedByteArray) -> void:
 
 
 func _read_inputs(id: int, bytes: PackedByteArray) -> void:
-	if bytes.size() < 2 or bytes[1] != slot_count or bytes.size() < 7 + slot_count * 4:
+	if bytes.size() < 2 or bytes[1] != slot_count or bytes.size() < 9 + slot_count * 4:
 		return
 	var buffer := StreamPeerBuffer.new()
 	buffer.data_array = bytes
 	buffer.seek(2)
 	var samples: PackedInt32Array = _advantage[id]
-	samples.append(local_tick - buffer.get_32())
+	samples.append(position() - buffer.get_32())
 	if samples.size() > ADVANTAGE_SAMPLES:
 		samples.remove_at(0)
 	_advantage[id] = samples
+	# A peer that has just acted on its readings has none to send; keep its last.
+	var theirs := buffer.get_16()
+	if theirs != NO_READING:
+		_their_readings[id] = theirs / 16.0
 	for slot in slot_count:
 		_acks[id][slot] = maxi(_acks[id][slot], buffer.get_32())
 	_heard[id] = true
-	var now := Time.get_ticks_usec()
+	var now := _now()
 	var runs := buffer.get_u8()
 	for i in runs:
 		if buffer.get_available_bytes() < 6:
