@@ -359,6 +359,19 @@ func suggested_delays() -> void:
 	check(steady.suggested_delay() >= 3 and steady.suggested_delay() == jerky.suggested_delay(), "Slow frames lengthen the delay, agreed by both (%d, %d)" % [steady.suggested_delay(), jerky.suggested_delay()])
 	jerky.leave()
 	steady.leave()
+	# A host drawing a frame every 300 ms, like the A22 loading a screen, answers pings only
+	# between frames. Those round trips measure the host, not the network, and are left out.
+	var loading := host_lobby()
+	var patient := join_lobby(loading, "Patient")
+	pump([loading, patient], 4.0, func(): return loading.can_start())
+	pump_frames([loading, patient], [300_000, 0], 3.0)
+	pump([loading, patient], 1.5)
+	var slowest := 0
+	for rtt in patient._round_trips:
+		slowest = maxi(slowest, rtt)
+	check(slowest < patient.HITCH_USEC and loading.suggested_delay() == 2, "Round trips that waited on a host's long frame are left out (slowest kept %d us, delay %d)" % [slowest, loading.suggested_delay()])
+	patient.leave()
+	loading.leave()
 
 
 # A link that keeps what it sends, so tests can deliver it by hand.
