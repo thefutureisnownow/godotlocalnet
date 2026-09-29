@@ -43,7 +43,9 @@ signal returned
 
 const KIND_PING := 1
 const KIND_PONG := 2
-const PING_INTERVAL_USEC := 250_000
+## Guests ping this often in the lobby: often enough for a steady reading within a second or
+## two, and to keep phone radios from napping between pings, which slows the ones that follow.
+const PING_INTERVAL_USEC := 100_000
 const CLOCK_SAMPLES := 16
 ## Round trips kept for judging how steady the link is.
 const LINK_SAMPLES := 40
