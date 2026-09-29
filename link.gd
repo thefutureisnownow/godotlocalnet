@@ -275,6 +275,10 @@ func debug_break_socket() -> void:
 
 func _on_connect(peer: ENetPacketPeer, data: int) -> void:
 	peer.set_timeout(32, 3000, 6000)
+	# ENet's throttle drops a share of unreliable packets whenever a round trip looks worse
+	# than usual. Lockstep inputs already repeat until acknowledged, so dropping them only
+	# makes them late: after a host's loading hitch it cost the first match 300 ms stalls.
+	peer.throttle_configure(5000, ENetPacketPeer.PACKET_THROTTLE_SCALE, 0)
 	if not is_host:
 		_connecting = null
 		_peers[HOST_ID] = peer

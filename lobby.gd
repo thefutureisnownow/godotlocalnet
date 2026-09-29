@@ -57,6 +57,10 @@ const LINK_SAMPLES := 120
 const RADIO_WAKE_USEC := 1_000_000
 ## How often a guest reports its link quality to the host.
 const REPORT_EVERY_USEC := 1_000_000
+## A round trip that waited on a frame longer than this at either end measures the device,
+## not the network (a host loading its next screen answers pings only between long frames),
+## so it's left out of the link quality.
+const HITCH_USEC := 50_000
 ## A client counts as synced, and can be started, once it has this many clock readings and
 ## LINK_READY round trips measured after the radio woke: a match can't start on a guess.
 const SYNCED_AFTER := 5
@@ -106,6 +110,8 @@ var _next_report_usec := 0
 var _next_ping_usec := 0
 var _reported_synced := false
 var _last_poll_usec := 0
+## How long the frame before this poll took: how long a packet could have waited unread.
+var _frame_gap_usec := 0
 var _frames := PackedInt32Array()
 var _next_host_report_usec := 0
 var _start_at := 0
@@ -319,6 +325,7 @@ func frame_usec() -> int:
 
 func _time_frame() -> void:
 	var now := Time.get_ticks_usec()
+	_frame_gap_usec = now - _last_poll_usec if _last_poll_usec > 0 else 0
 	if _last_poll_usec > 0 and now - _last_poll_usec <= LONGEST_FRAME_USEC:
 		_frames.append(now - _last_poll_usec)
 		if _frames.size() > FRAME_SAMPLES:
@@ -420,13 +427,15 @@ func _on_received(id: int, channel: int, bytes: PackedByteArray) -> void:
 	elif channel == LocalNetLink.CHANNEL_REALTIME and bytes.size() > 0:
 		if bytes[0] == KIND_PING and is_host and bytes.size() >= 9:
 			var pong := PackedByteArray([KIND_PONG])
-			pong.resize(17)
+			pong.resize(21)
 			pong.encode_s64(1, bytes.decode_s64(1))
 			pong.encode_s64(9, Time.get_ticks_usec())
+			pong.encode_u32(17, mini(_frame_gap_usec, 0xFFFFFFFF))
 			link.send(id, LocalNetLink.CHANNEL_REALTIME, pong, false)
 			link.flush()
 		elif bytes[0] == KIND_PONG and not is_host and bytes.size() >= 17:
-			_clock_sample(bytes.decode_s64(1), bytes.decode_s64(9), Time.get_ticks_usec())
+			var host_gap: int = bytes.decode_u32(17) if bytes.size() >= 21 else 0
+			_clock_sample(bytes.decode_s64(1), bytes.decode_s64(9), Time.get_ticks_usec(), maxi(host_gap, _frame_gap_usec) > HITCH_USEC)
 
 
 func _host_message(id: int, message: Dictionary) -> void:
@@ -513,7 +522,7 @@ func _client_message(message: Dictionary) -> void:
 			returned.emit()
 
 
-func _clock_sample(sent: int, host_time: int, now: int) -> void:
+func _clock_sample(sent: int, host_time: int, now: int, hitched := false) -> void:
 	_samples.append([now - sent, host_time - ((sent + now) >> 1)])
 	if _samples.size() > CLOCK_SAMPLES:
 		_samples.pop_front()
@@ -524,7 +533,7 @@ func _clock_sample(sent: int, host_time: int, now: int) -> void:
 			best = sample
 	clock_rtt_usec = best[0]
 	clock_offset_usec = best[1]
-	if now - _joined_usec >= RADIO_WAKE_USEC:
+	if now - _joined_usec >= RADIO_WAKE_USEC and not hitched:
 		_round_trips.append(now - sent)
 		if _round_trips.size() > LINK_SAMPLES:
 			_round_trips.remove_at(0)
