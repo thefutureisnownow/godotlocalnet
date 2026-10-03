@@ -13,9 +13,19 @@ extends RefCounted
 ## so each device can tell how far ahead of each peer it looks ([method tick_advantage]),
 ## and that reading of the receiver, so both halves meet: the time packets spend in flight
 ## adds to both readings alike and cancels out of [method clock_lead].
+##
+## Spectators ([member LocalNetLobby.max_spectators]) have no slot: [code]own_slot[/code]
+## is -1 and they never add input. The host relays every slot to them, the same way it
+## relays to players. They never slow players: the host leaves them out of its time sync
+## ([method timing_peers]), and since only players have slots, nobody waits on them. A
+## spectator that falls more than [member LocalNetLockstep.keep_ticks] behind would keep
+## the host from freeing old inputs, so the host stops holding inputs for it and emits
+## [signal spectator_dropped]. A host that doesn't play also has slot -1; it relays as usual.
 
 signal remote_input(slot: int, tick: int, arrived_usec: int)
 signal desynced(tick: int, peer_id: int)
+## Host only: spectator [param peer_id] fell too far behind and no longer gets inputs.
+signal spectator_dropped(peer_id: int)
 
 const KIND_INPUTS := 10
 const KIND_CHECKSUM := 11
@@ -50,9 +60,11 @@ var _checksums := {}
 var _remote_checksums := {}
 var _advantage := {}
 var _their_readings := {}
+var _dropped := {}
 
 
 ## [param peer_slots] maps each link peer to the slot it sends: see [method LocalNetLobby.peer_slots].
+## [param own_slot] is -1 on a device that doesn't play.
 func _init(net_link: LocalNetLink, slots: int, own_slot: int, peer_slots: Dictionary, input_delay := 2, bytes_per_input := 2) -> void:
 	link = net_link
 	slot_count = slots
@@ -83,12 +95,16 @@ func close() -> void:
 		link.received.disconnect(_on_received)
 
 
-## The next tick that needs local input.
+## The next tick that needs local input; -1 on a device with no slot.
 func next_local_tick() -> int:
+	if local_slot < 0:
+		return -1
 	return _latest[local_slot] + 1
 
 
 func add_local_input(tick: int, input: PackedByteArray) -> void:
+	if local_slot < 0:
+		return
 	assert(tick == next_local_tick(), "Local input must arrive one tick at a time")
 	var sized := input.duplicate()
 	sized.resize(input_size)
@@ -178,6 +194,24 @@ func peers() -> Array:
 	return _peer_slots.keys()
 
 
+## The peers whose schedules matter to this device's time sync: on the host, the players
+## (spectators are left out, so they never ease anyone); elsewhere, the host.
+func timing_peers() -> Array:
+	if not link.is_host:
+		return _peer_slots.keys()
+	return _peer_slots.keys().filter(func(id): return _peer_slots[id] >= 0)
+
+
+## True on a guest that watches: it has no slot and hears every input from the host.
+func is_spectating() -> bool:
+	return local_slot < 0 and not link.is_host
+
+
+## Host only: whether spectator [param id] fell too far behind; see [signal spectator_dropped].
+func is_dropped(id: int) -> bool:
+	return _dropped.has(id)
+
+
 ## Sends each peer what it's missing and acknowledges what arrived.
 func flush() -> void:
 	for id in _peer_slots:
@@ -187,13 +221,19 @@ func flush() -> void:
 	link.flush()
 
 
-## Frees inputs before [param tick], keeping any a peer still needs from us.
+## Frees inputs before [param tick], keeping any a peer still needs from us. A spectator
+## still missing inputs before [param tick] is dropped instead ([signal spectator_dropped]).
 func discard_before(tick: int) -> void:
+	if link.is_host:
+		for id in _peer_slots:
+			if _peer_slots[id] < 0 and not _dropped.has(id) and Array(_acks[id]).any(func(ack): return ack + 1 < tick):
+				_dropped[id] = true
+				spectator_dropped.emit(id)
 	var lowest := tick
 	for slot in slot_count:
 		var limit := tick
 		for id in _acks:
-			if _should_send(id, slot):
+			if _should_send(id, slot) and not _dropped.has(id):
 				limit = mini(limit, _acks[id][slot] + 1)
 		for old in range(_discarded_below[slot], limit):
 			_inputs[slot].erase(old)
@@ -227,6 +267,8 @@ func _should_send(id: int, slot: int) -> bool:
 
 
 func _packet_for(id: int) -> PackedByteArray:
+	if _dropped.has(id):
+		return PackedByteArray()
 	var runs := []
 	for slot in slot_count:
 		if _should_send(id, slot):

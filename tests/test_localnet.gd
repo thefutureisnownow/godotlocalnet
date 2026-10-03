@@ -48,6 +48,14 @@ func run() -> void:
 	departures()
 	wifi_route()
 	stats()
+	wire_version()
+	spectator_joins()
+	spectator_counts()
+	organiser(0.0, 0.0, 0.0, "organiser")
+	organiser(0.25, 12.0, 10.0, "organiser, lossy")
+	spectator_match()
+	slow_spectator()
+	spectator_dropped()
 	print("LOCALNET: %d checks, %d failures" % [checks, failures.size()])
 	for failure in failures:
 		print("  FAIL ", failure)
@@ -939,3 +947,286 @@ func stats() -> void:
 	check(is_equal_approx(s.stall_share(0), 1.0), "With no delay every input is late")
 	check(is_equal_approx(s.stall_share(1), 0.4), "One tick (8.3 ms) hides three of five")
 	check(s.delay_for(0.0) == 4, "Four ticks hide everything")
+
+
+# LocalNet 0.3: a guest from another LocalNet version is turned away, even with the same game.
+func wire_version() -> void:
+	var host := host_lobby()
+	for hello in [{"t": "hello", "game": GAME, "v": 1, "name": "Old"}, {"t": "hello", "game": GAME, "v": 1, "ln": LocalNetLobby.WIRE_VERSION + 1, "name": "Newer"}]:
+		var old := LocalNetLink.new()
+		old.join("127.0.0.1", host.link.port)
+		var reason := [""]
+		old.peer_connected.connect(func(id):
+			old.send(id, LocalNetLink.CHANNEL_CONTROL, var_to_bytes(hello), true)
+			old.flush())
+		old.received.connect(func(_id, _channel, bytes):
+			var message = bytes_to_var(bytes)
+			if message is Dictionary and message.get("t") == "reject":
+				reason[0] = message.reason)
+		pump([host, old], 3.0, func(): return reason[0] != "")
+		check(reason[0] == "Different LocalNet version" and host.members.size() == 1, "A hello %s is turned away: %s" % ["without a LocalNet version" if not hello.has("ln") else "from another LocalNet version", reason[0]])
+		old.close()
+	host.leave()
+
+
+func join_as(host: LocalNetLobby, player_name: String, role: String) -> LocalNetLobby:
+	var lobby := LocalNetLobby.new(GAME, 1)
+	check(lobby.join("127.0.0.1", host.link.port, player_name, "", role) == OK, "%s starts joining" % player_name)
+	return lobby
+
+
+func rejection(host: LocalNetLobby, others: Array, guest: LocalNetLobby) -> String:
+	var reason := [""]
+	guest.rejected.connect(func(r): reason[0] = r)
+	pump([host, guest] + others, 3.0, func(): return reason[0] != "")
+	guest.leave()
+	return reason[0]
+
+
+func spectator_joins() -> void:
+	var closed := host_lobby()
+	check(rejection(closed, [], join_as(closed, "Nosy", "spectator")) == "Spectators aren't allowed", "Spectators are turned away by default")
+	closed.leave()
+	var host := LocalNetLobby.new(GAME, 1)
+	host.max_spectators = 1
+	host.host("Host", 2)
+	var watcher := join_as(host, "Watcher", "spectator")
+	pump([host, watcher], 3.0, func(): return watcher.members.size() == 2)
+	var id := watcher.local_id
+	check(host.members.has(id) and host.members[id].role == "spectator" and host.members[id].slot == -1, "A spectator joins with no slot")
+	check(watcher.is_spectator() and watcher.local_slot() == -1 and not host.is_spectator() and host.members[host.local_id].role == "player", "Each side knows who watches and who plays")
+	check(rejection(host, [watcher], join_as(host, "Crowd", "spectator")) == "No room for spectators", "Spectators beyond the limit are turned away")
+	var player := join_lobby(host, "Player")
+	pump([host, watcher, player], 3.0, func(): return host.members.size() == 3)
+	check(host.members.size() == 3 and player.local_slot() == 1, "A spectator doesn't take a player's place")
+	check(rejection(host, [watcher, player], join_lobby(host, "Third")) == "Lobby is full", "Players are still limited to max_players")
+	for l in [player, watcher, host]:
+		l.leave()
+
+
+func spectator_counts() -> void:
+	var host := LocalNetLobby.new(GAME, 1)
+	host.max_spectators = 2
+	host.host("Host", 3)
+	var watcher := join_as(host, "Watcher", "spectator")
+	watcher.link.debug_latency_msec = 120.0
+	pump([host, watcher], 4.0, func(): return host.members.get(watcher.local_id, {}).get("synced", false))
+	check(not host.can_start(), "A host and a spectator aren't enough to start")
+	var player := join_lobby(host, "Player")
+	var everyone := [host, watcher, player]
+	pump(everyone, 5.0, func(): return host.can_start())
+	pump(everyone, 2.5)
+	var w := watcher.local_id
+	var p := player.local_id
+	check(host.can_start() and host.players() == [1, p] and host.spectators() == [w], "Players and spectators are listed apart (%s, %s)" % [host.players(), host.spectators()])
+	var advert := host.advert()
+	check(advert.players == 2 and advert.spectators == 1 and advert.max_spectators == 2, "The advert counts players and spectators apart: %s" % [advert])
+	check(host.members[w].net.get("rtt_p75_usec", 0) > 100_000, "The spectator's slow link is measured (%d us)" % host.members[w].net.get("rtt_p75_usec", 0))
+	var delays := everyone.map(func(l): return l.suggested_delay())
+	check(delays[0] <= 3 and delays.all(func(d): return d == delays[0]), "A spectator's slow link doesn't lengthen the delay, agreed by all (%s)" % [delays])
+	host.set_ready(true)
+	player.set_ready(true)
+	pump(everyone, 2.0, func(): return host.members[p].ready)
+	check(host.can_start(true), "Spectators needn't be ready")
+	host.start()
+	pump(everyone, 2.0, func(): return watcher.state == "started")
+	check(host.members[1].slot == 0 and host.members[p].slot == 1 and host.members[w].slot == -1, "Slots are numbered over the players only")
+	check(host.peer_slots() == {w: -1, p: 1} and watcher.peer_slots() == {1: -1}, "The host maps a spectator to no slot (%s)" % [host.peer_slots()])
+	for l in everyone:
+		l.leave()
+
+
+# Every lobby runs a lockstep match; afterwards every device, spectators included, must
+# have stepped the same inputs. Returns the runners, host first.
+func lockstep_match(lobbies: Array, drop: float, latency: float, jitter: float, label: String, delay := 3, ticks := 480) -> Array:
+	var host: LocalNetLobby = lobbies[0]
+	pump(lobbies, 6.0, func(): return host.can_start() and lobbies.all(func(l): return l.members.size() == lobbies.size()))
+	check(host.can_start(), "%s: everyone joins" % label)
+	var starts := {}
+	for lobby in lobbies:
+		lobby.started.connect(func(_config, at): starts[lobby] = at)
+	host.start()
+	pump(lobbies, 2.0, func(): return starts.size() == lobbies.size())
+	for lobby in lobbies:
+		lobby.link.debug_drop = drop
+		lobby.link.debug_latency_msec = latency
+		lobby.link.debug_jitter_msec = jitter
+	var players := host.players().size()
+	var runners := []
+	var desyncs := []
+	for lobby in lobbies:
+		var sync := LocalNetInputSync.new(lobby.link, players, lobby.local_slot(), lobby.peer_slots(), delay, 2)
+		sync.desynced.connect(func(t, _id): desyncs.append(t))
+		var rng := RandomNumberGenerator.new()
+		rng.seed = lobby.local_slot() + 11
+		var history := PackedInt64Array()
+		var runner := LocalNetLockstep.new(sync, starts[lobby], 120,
+			func(_t): return PackedByteArray([rng.randi() % 256, rng.randi() % 256]),
+			func(_t, inputs): history.append(hash(inputs)),
+			func(): return history[-1])
+		runners.append({"runner": runner, "history": history})
+	var step := func():
+		for r in runners:
+			if r.runner.tick < ticks:
+				r.runner.max_ticks_per_frame = mini(8, ticks - r.runner.tick)
+				r.runner.advance()
+			else:
+				r.runner.sync.flush()
+		return runners.all(func(r): return r.runner.tick >= ticks)
+	var finished := pump(lobbies, 20.0, step)
+	pump(lobbies, 0.3)
+	check(finished, "%s: all %d devices reach tick %d" % [label, lobbies.size(), ticks])
+	check(runners.all(func(r): return r.history == runners[0].history), "%s: every device stepped identical inputs" % label)
+	check(desyncs.is_empty() and runners.all(func(r): return r.runner.sync._checksums.size() > 0), "%s: checksums agree on every device" % label)
+	for r in runners:
+		r.runner.sync.close()
+	for lobby in lobbies:
+		lobby.leave()
+	return runners.map(func(r): return r.runner)
+
+
+# A host that doesn't play (a PC driving a big screen) relays two phones' inputs.
+func organiser(drop: float, latency: float, jitter: float, label: String) -> void:
+	var host := LocalNetLobby.new(GAME, 1)
+	check(host.host("Screen", 2, "", 0, false) == OK, "%s: a host can open a lobby it doesn't play in" % label)
+	check(host.is_spectator() and host.local_slot() == -1 and host.players().is_empty(), "%s: the host has no slot" % label)
+	var lobbies: Array = [host, join_lobby(host, "One")]
+	pump(lobbies, 4.0, func(): return host.members.size() == 2 and host.members.values().all(func(m): return m.synced))
+	check(host.members.size() == 2 and not host.can_start(), "%s: one player isn't enough to start" % label)
+	lobbies.append(join_lobby(host, "Two"))
+	pump(lobbies, 6.0, func(): return host.can_start())
+	pump(lobbies, 2.5)
+	var plays := LocalNetLobby.new(GAME, 1)
+	plays.members = host.members.duplicate(true)
+	plays.members[1].role = "player"
+	var delays := lobbies.map(func(l): return l.suggested_delay())
+	check(delays.all(func(d): return d == delays[0]) and delays[0] >= plays.suggested_delay(), "%s: the relayed delay is agreed by all, and no shorter than a direct one (%s, %d)" % [label, delays, plays.suggested_delay()])
+	var runners := lockstep_match(lobbies, drop, latency, jitter, label)
+	if runners.size() == 3:
+		check(runners[0].sync.next_local_tick() == -1 and runners[0].sync._inputs.all(func(slot): return not slot.is_empty()), "%s: the host samples nothing but holds both players' inputs" % label)
+
+
+# A host and a guest play while a spectator follows the relayed inputs.
+func spectator_match() -> void:
+	var host := LocalNetLobby.new(GAME, 1)
+	host.max_spectators = 1
+	host.host("Host", 2)
+	var lobbies: Array = [host, join_lobby(host, "Guest"), join_as(host, "Watcher", "spectator")]
+	var runners := lockstep_match(lobbies, 0.1, 5.0, 5.0, "spectated")
+	if runners.size() == 3:
+		check(runners[2].sync.is_spectating() and runners[2].tick >= 480, "Spectated: the spectator follows the whole match")
+		check(runners[0].sync.timing_peers() == [lobbies[1].local_id], "Spectated: the host's time sync only counts the player")
+
+
+# A link that keeps what it sends and who to, so a test can deliver it later.
+class AddressedLink extends LocalNetLink:
+	var outbox := []
+
+	func send(id: int, channel: int, bytes: PackedByteArray, _reliable: bool) -> void:
+		outbox.append([id, channel, bytes])
+
+
+# A host at 90 fps and a guest at 60 play while a spectator at 20 fps, with a 120 ms
+# link, watches. Then a quick spectator that started 100 ms late catches up.
+func slow_spectator() -> void:
+	var result := trio_sim(true, 20.0, 120_000, 0)
+	var alone := trio_sim(false, 20.0, 120_000, 0)
+	var host: LocalNetLockstep = result.runners[0]
+	var guest: LocalNetLockstep = result.runners[1]
+	var watcher: LocalNetLockstep = result.runners[2]
+	check(host.stalled_frames == alone.runners[0].stalled_frames and guest.stalled_frames == alone.runners[1].stalled_frames, "A slow spectator never stalls the players (%d, %d frames; %d, %d without it)" % [host.stalled_frames, guest.stalled_frames, alone.runners[0].stalled_frames, alone.runners[1].stalled_frames])
+	check(host.eased_usec == alone.runners[0].eased_usec and guest.eased_usec == alone.runners[1].eased_usec, "...and never eases their schedules (%d, %d us)" % [host.eased_usec, guest.eased_usec])
+	check(host.sync._acks[3][0] > 400 and host.sync.timing_peers() == [2], "The host hears the spectator but leaves it out of time sync")
+	check(watcher.tick >= result.ticks - 40 and result.histories[2] == result.histories[0].slice(0, result.histories[2].size()), "The spectator follows the same inputs, as far behind as its link needs (tick %d of %d)" % [watcher.tick, result.ticks])
+	var late := trio_sim(true, 60.0, 3000, 100_000)
+	var off: float = (late.runners[2].schedule_usec - late.runners[0].schedule_usec) / host.tick_usec
+	check(late.runners[2].caught_up_usec > 0 and absf(off) < 1.0, "A spectator that started late catches up with the schedule (%.2f ticks off)" % off)
+	check(late.runners[2].frames - late.runners[2].stalled_frames > 0 and late.runners[0].eased_usec == 0, "...without anyone easing for it (%d us)" % late.runners[0].eased_usec)
+
+
+func trio_sim(with_spectator: bool, watcher_fps: float, watcher_latency: int, watcher_late: int, seconds := 8.0) -> Dictionary:
+	var links := []
+	for i in 3:
+		links.append(AddressedLink.new())
+	links[0].is_host = true
+	var syncs := [
+		LocalNetInputSync.new(links[0], 2, 0, {2: 1, 3: -1} if with_spectator else {2: 1}, 6, 1),
+		LocalNetInputSync.new(links[1], 2, 1, {1: -1}, 6, 1),
+		LocalNetInputSync.new(links[2], 2, -1, {1: -1}, 6, 1),
+	]
+	var fps := [90.0, 60.0, watcher_fps]
+	var latency := [3000, 3000, watcher_latency]
+	var histories := [PackedInt64Array(), PackedInt64Array(), PackedInt64Array()]
+	var runners := []
+	var clock := {"now": 0}
+	for i in 3:
+		var history: PackedInt64Array = histories[i]
+		var runner := LocalNetLockstep.new(syncs[i], watcher_late if i == 2 else 0, 120, func(t): return PackedByteArray([t % 7]), func(_t, inputs): history.append(hash(inputs)))
+		runners.append(runner)
+		syncs[i].clock = func(): return clock.now
+	var next_frame := [0.0, 0.0, 0.0]
+	var in_flight := []
+	var devices := 3 if with_spectator else 2
+	while true:
+		var side := 0
+		for i in devices:
+			if next_frame[i] < next_frame[side]:
+				side = i
+		if next_frame[side] >= seconds * 1_000_000:
+			break
+		var now := int(next_frame[side])
+		clock.now = now
+		next_frame[side] += 1_000_000.0 / fps[side]
+		for packet in in_flight.duplicate():
+			if packet.to == side and packet.due <= now:
+				syncs[side]._on_received(packet.from, packet.channel, packet.bytes)
+				in_flight.erase(packet)
+		runners[side].advance(now)
+		for sent in links[side].outbox:
+			var to: int = sent[0] - 1
+			if to < devices:
+				in_flight.append({"to": to, "from": side + 1, "channel": sent[1], "bytes": sent[2], "due": now + maxi(latency[side], latency[to])})
+		links[side].outbox.clear()
+	return {"runners": runners, "histories": histories, "ticks": int(seconds * 120)}
+
+
+# A spectator that stops acknowledging is let go once it's keep_ticks behind, so the
+# host can free its inputs.
+func spectator_dropped() -> void:
+	var host_link := AddressedLink.new()
+	host_link.is_host = true
+	var host := LocalNetInputSync.new(host_link, 2, 0, {2: 1, 3: -1}, 2, 1)
+	var guest := LocalNetInputSync.new(AddressedLink.new(), 2, 1, {1: -1}, 2, 1)
+	var watcher := LocalNetInputSync.new(AddressedLink.new(), 2, -1, {1: -1}, 2, 1)
+	check(watcher.next_local_tick() == -1 and watcher.is_spectating() and not host.is_spectating(), "A device with no slot has no input of its own to give")
+	watcher.add_local_input(0, PackedByteArray([1]))
+	check(watcher.latest(0) == 1 and watcher.latest(1) == 1, "...and adding some does nothing")
+	var dropped := []
+	host.spectator_dropped.connect(func(id): dropped.append(id))
+	var runner := LocalNetLockstep.new(host, 0, 120, func(_t): return PackedByteArray([1]), func(_t, _inputs): pass)
+	runner.keep_ticks = 120
+	runner.time_sync = false
+	var tick_usec := 1_000_000.0 / 120
+	var deliver_all := func(watching: bool):
+		for packet in host_link.outbox:
+			if packet[0] == 2:
+				guest._on_received(1, packet[1], packet[2])
+			elif watching:
+				watcher._on_received(1, packet[1], packet[2])
+		host_link.outbox.clear()
+		for pair in [[guest, 2], [watcher, 3]]:
+			if pair[1] == 2 or watching:
+				pair[0].flush()
+				for packet in pair[0].link.outbox:
+					host._on_received(pair[1], packet[1], packet[2])
+			pair[0].link.outbox.clear()
+	for t in range(0, 400):
+		while guest.next_local_tick() <= t + 2:
+			guest.add_local_input(guest.next_local_tick(), PackedByteArray([2]))
+		runner.advance(int(t * tick_usec) + 1)
+		deliver_all.call(t < 50)
+	check(dropped == [3], "A spectator that falls keep_ticks behind is dropped, once: %s" % [dropped])
+	check(host.is_dropped(3) and host._packet_for(3).is_empty() and not host._packet_for(2).is_empty(), "The host stops sending to it, and carries on with the player")
+	check(host._inputs[0].size() < 200 and not host._inputs[0].has(100), "Inputs it never confirmed are freed (%d kept)" % host._inputs[0].size())
+	check(runner.tick >= 395 and runner.stalled_frames == 0, "The players never waited for it (tick %d, %d stalled frames)" % [runner.tick, runner.stalled_frames])
+
