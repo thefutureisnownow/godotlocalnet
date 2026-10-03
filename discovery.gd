@@ -60,7 +60,7 @@ func _init(game: String, game_version: int) -> void:
 
 
 ## Starts answering probes on [param port], or the first free fallback after it.
-## [param info] should hold id, name, port, players, max and state.
+## [param info] should hold id, name, port, players, max and state ([method LocalNetLobby.advert]).
 func advertise(info: Dictionary, port := PORT) -> Error:
 	stop_advertising()
 	var err := ERR_UNAVAILABLE
@@ -254,6 +254,8 @@ func _read_replies(socket: PacketPeerUDP) -> void:
 			"port": int(reply.get("port", 0)),
 			"players": int(reply.get("players", 0)),
 			"max_players": int(reply.get("max", 0)),
+			"spectators": int(reply.get("spectators", 0)),
+			"max_spectators": int(reply.get("max_spectators", 0)),
 			"state": str(reply.get("state", "")),
 			"code_required": bool(reply.get("code", false)),
 			"version": int(reply.get("v", 0)),
