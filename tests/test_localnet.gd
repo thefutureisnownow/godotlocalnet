@@ -46,6 +46,7 @@ func run() -> void:
 	lockstep_through_drop()
 	desync()
 	departures()
+	wifi_route()
 	stats()
 	print("LOCALNET: %d checks, %d failures" % [checks, failures.size()])
 	for failure in failures:
@@ -921,6 +922,13 @@ func departures() -> void:
 	pump([again], 3.0, func(): return reason[0] != "")
 	check(reason[0] == "The host left", "Guest notices the host leaving")
 	again.leave()
+
+
+# Off Android there's nothing to bind: the default route already reaches the LAN.
+func wifi_route() -> void:
+	check(LocalNetWifiRoute.bind() == "n/a" and not LocalNetWifiRoute.is_bound(), "Wi-Fi binding is Android-only")
+	LocalNetWifiRoute.release()
+	check(not LocalNetWifiRoute.is_bound(), "Releasing without a binding is harmless")
 
 
 func stats() -> void:

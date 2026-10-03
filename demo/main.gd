@@ -181,6 +181,7 @@ func start_hosting() -> void:
 	player_name()
 	var port := int(port_edit.text) if port_edit and is_instance_valid(port_edit) and port_edit.text.is_valid_int() else 0
 	leave()
+	LocalNetWifiRoute.bind()
 	lobby = new_lobby()
 	var err := lobby.host(player_name(), settings.players, "", port)
 	if err != OK:
@@ -336,6 +337,7 @@ func show_join() -> void:
 	button("Connect", func(): join_address(address_edit.text), manual)
 	button("Back", go_home)
 	var targets := PackedStringArray(["127.0.0.1"]) if options.has("loopback") else PackedStringArray()
+	LocalNetWifiRoute.bind()
 	discovery.scan(targets)
 
 
@@ -377,6 +379,7 @@ func join_address(typed: String) -> void:
 	else:
 		joining_address = parts[0]
 		joining_since = Time.get_ticks_usec()
+		LocalNetWifiRoute.bind()
 		discovery.scan(PackedStringArray([joining_address]))
 		status_label.text = "Asking %s…" % joining_address
 
@@ -384,6 +387,7 @@ func join_address(typed: String) -> void:
 func connect_to(address: String, port: int) -> void:
 	joining_address = ""
 	discovery.stop_scanning()
+	LocalNetWifiRoute.bind()
 	lobby = new_lobby()
 	lobby.join(address, port, player_name())
 	show_guest_lobby("Joining %s:%d" % [address, port], "Connecting…")
@@ -461,6 +465,7 @@ func leave() -> void:
 	if lobby:
 		lobby.leave()
 	lobby = null
+	LocalNetWifiRoute.release()
 
 
 func stop_sync() -> void:
