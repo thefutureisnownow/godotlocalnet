@@ -19,8 +19,10 @@ extends RefCounted
 ## stop waiting early with [method give_up].
 ##
 ## Members are players or spectators ([member max_spectators]). Spectators have no slot
-## (-1) and never hold up players: they don't count towards [member max_players], the
-## two players [method can_start] needs or [method suggested_delay], and need no ready flag.
+## (-1) and don't hold up players: they don't count towards [member max_players], the
+## two players [method can_start] needs or [method suggested_delay], and need no ready flag
+## or content. Only their clock sync, and their loading with [member wait_for_loading],
+## are waited for, so they can follow the match from its first tick.
 ## A host can also stay out of the match itself ([code]host_plays[/code] in [method host]),
 ## as a PC driving a big screen while phones play: its member is then a spectator too.
 ## Roles are a lobby matter only; how a game keeps its spectators' state up to date is its
