@@ -56,6 +56,12 @@ func run() -> void:
 	spectator_match()
 	slow_spectator()
 	spectator_dropped()
+	content_basics()
+	content_relay()
+	content_mismatch()
+	content_resume()
+	content_limits()
+	content_flow()
 	print("LOCALNET: %d checks, %d failures" % [checks, failures.size()])
 	for failure in failures:
 		print("  FAIL ", failure)
@@ -1230,3 +1236,279 @@ func spectator_dropped() -> void:
 	check(host._inputs[0].size() < 200 and not host._inputs[0].has(100), "Inputs it never confirmed are freed (%d kept)" % host._inputs[0].size())
 	check(runner.tick >= 395 and runner.stalled_frames == 0, "The players never waited for it (tick %d, %d stalled frames)" % [runner.tick, runner.stalled_frames])
 
+
+const CONTENT_ROOT := "user://localnet-test-content"
+
+
+# Content in a cache of its own, emptied first.
+func content_for(lobby: LocalNetLobby, folder: String) -> LocalNetContent:
+	var content := LocalNetContent.new(lobby)
+	content.cache_dir = CONTENT_ROOT.path_join(folder)
+	DirAccess.make_dir_recursive_absolute(content.cache_dir)
+	for file in DirAccess.get_files_at(content.cache_dir):
+		DirAccess.remove_absolute(content.cache_dir.path_join(file))
+	return content
+
+
+func blob(size: int) -> PackedByteArray:
+	return Crypto.new().generate_random_bytes(size)
+
+
+func content_basics() -> void:
+	var pair := joined_pair()
+	var host: LocalNetLobby = pair[0]
+	var guest: LocalNetLobby = pair[1]
+	var hc := content_for(host, "basics-host")
+	var gc := content_for(guest, "basics-guest")
+	var everything := pair + [hc, gc]
+	var bytes := blob(300_000)
+	var item := LocalNetContent.describe("stage", "reef", bytes)
+	check(item.type == "stage" and item.id == "reef" and item.size == 300_000 and item.hash.length() == 64, "An item says what it is, its hash and its size")
+	var digest := HashingContext.new()
+	digest.start(HashingContext.HASH_SHA256)
+	digest.update(bytes)
+	check(item.hash == digest.finish().hex_encode(), "The item's hash is the sha256 of its bytes")
+	hc.offer(item, bytes)
+	hc.require([item])
+	var got := []
+	var present := []
+	gc.received.connect(func(i, path): got.append([i, path]))
+	hc.all_present.connect(func(): present.append("host"))
+	gc.all_present.connect(func(): present.append("guest"))
+	check(host.can_start() and not host.can_start(false, true), "Required content holds up a start that asks for it, and only that")
+	pump(everything, 10.0, func(): return got.size() == 1 and host.can_start(false, true))
+	check(got.size() == 1 and got[0][0].hash == item.hash and FileAccess.get_file_as_bytes(got[0][1]) == bytes, "The guest fetches what the match needs, byte for byte")
+	check(gc.has(item.hash) and gc.missing().is_empty() and gc.path_for(item.hash) == got[0][1] and not FileAccess.file_exists(got[0][1] + ".part"), "The guest holds it in its cache, with nothing partial left")
+	check(guest.needed_content.size() == 1 and host.members[guest.local_id].get("content", {}).get("missing", -1) == 0, "The guest heard what's needed and reports nothing missing")
+	check(host.can_start(false, true), "...so the host can start")
+	check(present.has("host") and present.has("guest") and present.size() == 2, "Both sides say they hold everything, once each: %s" % [present])
+	# Already in the cache: a second lobby needs no transfer.
+	var progress := [0]
+	gc.progress.connect(func(_h, _b, _t): progress[0] += 1)
+	hc.require([])
+	hc.require([item])
+	pump(everything, 2.0, func(): return host.can_start(false, true))
+	check(progress[0] == 0 and host.can_start(false, true), "Content already cached isn't fetched again")
+	for c in [hc, gc]:
+		c.close()
+	for l in pair:
+		l.leave()
+
+
+# Only one guest has the item: the host fetches it from that guest and passes it on.
+func content_relay() -> void:
+	var host := host_lobby(3)
+	var has := join_lobby(host, "Has")
+	var needs := join_lobby(host, "Needs")
+	var lobbies := [host, has, needs]
+	pump(lobbies, 5.0, func(): return host.can_start() and host.members.size() == 3)
+	var hc := content_for(host, "relay-host")
+	var ac := content_for(has, "relay-has")
+	var bc := content_for(needs, "relay-needs")
+	var bytes := blob(200_000)
+	var source := CONTENT_ROOT.path_join("relay-source.bin")
+	var file := FileAccess.open(source, FileAccess.WRITE)
+	file.store_buffer(bytes)
+	file.close()
+	var item := LocalNetContent.describe("car", "bakkie", source)
+	ac.offer(item, source)
+	hc.require([item])
+	var got := {}
+	hc.received.connect(func(_i, path): got["host"] = path)
+	bc.received.connect(func(_i, path): got["needs"] = path)
+	pump(lobbies + [hc, ac, bc], 10.0, func(): return got.size() == 2 and host.can_start(false, true))
+	check(got.size() == 2 and got.values().all(func(path): return FileAccess.get_file_as_bytes(path) == bytes), "An item only a guest has reaches the other guest through the host")
+	check(host.can_start(false, true) and not ac._fetches.has(item.hash), "Everyone holds it, and the guest that had it fetched nothing")
+	for c in [hc, ac, bc]:
+		c.close()
+	for l in lobbies:
+		l.leave()
+
+
+func content_mismatch() -> void:
+	var pair := joined_pair()
+	var hc := content_for(pair[0], "mismatch-host")
+	var gc := content_for(pair[1], "mismatch-guest")
+	var bytes := blob(100_000)
+	var item := LocalNetContent.describe("stage", "reef", bytes)
+	var tampered := bytes.duplicate()
+	tampered[5000] ^= 0xFF
+	hc.offer(item, tampered)
+	hc.require([item])
+	var failures := []
+	gc.failed.connect(func(i, reason): failures.append([i.hash, reason]))
+	pump(pair + [hc, gc], 5.0, func(): return not failures.is_empty())
+	check(failures == [[item.hash, "Didn't match its hash"]], "Bytes that don't match their hash are rejected: %s" % [failures])
+	check(not gc.has(item.hash) and DirAccess.get_files_at(gc.cache_dir).is_empty(), "...and thrown away")
+	pump(pair + [hc, gc], 0.5)
+	check(not pair[0].can_start(false, true) and failures.size() == 1, "The start waits, and the guest doesn't keep asking for the bad copy")
+	for c in [hc, gc]:
+		c.close()
+	for l in pair:
+		l.leave()
+
+
+# A transfer survives a dropped connection and a match in between, and a fresh start of
+# the app picks up where the last one stopped.
+func content_resume() -> void:
+	var pair := joined_pair()
+	var host: LocalNetLobby = pair[0]
+	var guest: LocalNetLobby = pair[1]
+	var hc := content_for(host, "resume-host")
+	var gc := content_for(guest, "resume-guest")
+	hc.budget_bytes = LocalNetContent.CHUNK_BYTES
+	var bytes := blob(4 * 1024 * 1024)
+	var item := LocalNetContent.describe("track", "long", bytes)
+	hc.offer(item, bytes)
+	hc.require([item])
+	var log := []
+	gc.progress.connect(func(_h, b, _t): log.append(b))
+	var everything := [host, hc, guest, gc]
+	var every := [4000, 4000, 0, 0]
+	pump_frames(everything, every, 10.0, func(): return not log.is_empty() and log.back() > item.size / 5)
+	var before: int = log.back() if log else 0
+	guest.link.debug_drop_connection(LocalNetLink.HOST_ID, 300)
+	pump_frames(everything, every, 4.0, func(): return guest.link.is_peer_connected(LocalNetLink.HOST_ID) and log.back() > before + 4 * LocalNetContent.CHUNK_BYTES)
+	var after := log.filter(func(b): return b > before)
+	check(before > 0 and not after.is_empty(), "The transfer carries on after a dropped connection")
+	var increasing := true
+	for i in range(1, log.size()):
+		increasing = increasing and log[i] > log[i - 1]
+	check(increasing, "...from where it stopped, never starting over")
+	# A match pauses it, and returning to the lobby picks it up again.
+	host.start()
+	pump_frames(everything, every, 1.0, func(): return guest.state == "started")
+	pump_frames(everything, every, 0.3)
+	var paused: int = log.back()
+	pump_frames(everything, every, 0.8)
+	check(guest.state == "started" and log.back() == paused and paused < item.size, "Transfers pause while a match is on (%d of %d bytes)" % [paused, item.size])
+	host.return_to_lobby()
+	pump_frames(everything, every, 2.0, func(): return log.back() > paused + 4 * LocalNetContent.CHUNK_BYTES)
+	check(log.back() > paused, "...and carry on back in the lobby")
+	# The app is closed mid-transfer; a new session picks up the partial file.
+	var stopped: int = log.back()
+	gc.close()
+	guest.leave()
+	check(FileAccess.file_exists(gc.cache_dir.path_join(item.hash + ".part")), "A partial download is kept")
+	var again := join_lobby(host, "Again")
+	var fresh := LocalNetContent.new(again)
+	fresh.cache_dir = gc.cache_dir
+	var resumed := []
+	var got := []
+	fresh.progress.connect(func(_h, b, _t): resumed.append(b))
+	fresh.received.connect(func(_i, path): got.append(path))
+	pump([host, hc, again, fresh], 20.0, func(): return not got.is_empty())
+	check(not resumed.is_empty() and resumed[0] > stopped - 8 * LocalNetContent.CHUNK_BYTES and resumed[0] <= stopped + LocalNetContent.CHUNK_BYTES, "A new session carries on from the partial file (%d, stopped at %d)" % [resumed[0] if resumed else -1, stopped])
+	check(got.size() == 1 and FileAccess.get_file_as_bytes(got[0]) == bytes, "...and the result matches byte for byte")
+	for c in [hc, fresh]:
+		c.close()
+	for l in [host, again]:
+		l.leave()
+
+
+func content_limits() -> void:
+	var pair := joined_pair()
+	var host: LocalNetLobby = pair[0]
+	var guest: LocalNetLobby = pair[1]
+	var hc := content_for(host, "limits-host")
+	var gc := content_for(guest, "limits-guest")
+	var everything := pair + [hc, gc]
+	var bytes := blob(200_000)
+	var big := LocalNetContent.describe("mod", "huge", bytes)
+	gc.max_item_bytes = 100_000
+	hc.offer(big, bytes)
+	hc.require([big])
+	var failures := []
+	gc.failed.connect(func(i, reason): failures.append(reason))
+	var sent := [0]
+	var count_content := func(_id, channel, _bytes):
+		if channel == LocalNetLink.CHANNEL_CONTENT:
+			sent[0] += 1
+	host.link.received.connect(count_content)
+	pump(everything, 2.0)
+	check(failures.size() == 1 and failures[0].begins_with("Too big") and sent[0] == 0, "An item over max_item_bytes is never asked for: %s" % [failures])
+	# Chunks nobody asked for, sent over the link and handed in directly, are ignored.
+	var stray := blob(10_000)
+	var stray_item := LocalNetContent.describe("stage", "stray", stray)
+	var chunk := hc._packet(LocalNetContent.KIND_CHUNK, stray_item.hash.hex_decode(), 0)
+	chunk.append_array(stray)
+	host.link.send(guest.local_id, LocalNetLink.CHANNEL_CONTENT, chunk, true)
+	var progressed := [0]
+	gc.progress.connect(func(_h, _b, _t): progressed[0] += 1)
+	gc._on_received(LocalNetLink.HOST_ID, LocalNetLink.CHANNEL_CONTENT, chunk)
+	pump(everything, 1.0)
+	check(progressed[0] == 0 and sent[0] == 0 and not gc.has(stray_item.hash) and not FileAccess.file_exists(gc.cache_dir.path_join(stray_item.hash + ".part")), "Chunks nobody asked for are ignored, and not acknowledged")
+	# Asking for something the host never offered gets a refusal, not the bytes.
+	var refused := [0]
+	guest.link.received.connect(func(_id, channel, b):
+		if channel == LocalNetLink.CHANNEL_CONTENT and b[0] == LocalNetContent.KIND_NOPE:
+			refused[0] += 1)
+	hc.offer(stray_item, stray)
+	var hidden := LocalNetContent.describe("stage", "hidden", blob(5_000))
+	gc._send_want(LocalNetLink.HOST_ID, hidden.hash, 0)
+	guest.link.flush()
+	pump(everything, 1.0, func(): return refused[0] > 0)
+	check(refused[0] == 1 and hc._sends.is_empty(), "Only offered items are served")
+	for c in [hc, gc]:
+		c.close()
+	for l in pair:
+		l.leave()
+
+
+# A large transfer keeps a small window, so lobby messages and checksums still go
+# through at once.
+func content_flow() -> void:
+	var pair := joined_pair()
+	var host: LocalNetLobby = pair[0]
+	var guest: LocalNetLobby = pair[1]
+	var hc := content_for(host, "flow-host")
+	var gc := content_for(guest, "flow-guest")
+	var bytes := blob(16 * 1024 * 1024)
+	var item := LocalNetContent.describe("mod", "big", bytes)
+	hc.offer(item, bytes)
+	hc.require([item])
+	var done := []
+	gc.received.connect(func(_i, path): done.append(Time.get_ticks_usec()))
+	var config_sent := {}
+	var config_late := []
+	var event_sent := {}
+	var event_late := []
+	guest.members_changed.connect(func():
+		var n: int = guest.config.get("n", -1)
+		if config_sent.has(n):
+			config_late.append(Time.get_ticks_usec() - config_sent[n])
+			config_sent.erase(n))
+	guest.link.received.connect(func(_id, channel, b):
+		if channel == LocalNetLink.CHANNEL_EVENTS and b.size() == 9 and event_sent.has(b.decode_u32(1)):
+			event_late.append(Time.get_ticks_usec() - event_sent[b.decode_u32(1)]))
+	var most_in_flight := [0]
+	var began := Time.get_ticks_usec()
+	var n := [0]
+	var next := [0]
+	var each := func():
+		for send in hc._sends.values():
+			most_in_flight[0] = maxi(most_in_flight[0], send.in_flight.size())
+		if Time.get_ticks_usec() >= next[0] and done.is_empty():
+			next[0] = Time.get_ticks_usec() + 50_000
+			n[0] += 1
+			config_sent[n[0]] = Time.get_ticks_usec()
+			host.set_config({"n": n[0]})
+			var checksum := PackedByteArray([LocalNetInputSync.KIND_CHECKSUM])
+			checksum.resize(9)
+			checksum.encode_u32(1, n[0])
+			event_sent[n[0]] = Time.get_ticks_usec()
+			host.link.send(guest.local_id, LocalNetLink.CHANNEL_EVENTS, checksum, true)
+			host.link.flush()
+		return not done.is_empty()
+	pump(pair + [hc, gc], 30.0, each)
+	var seconds: float = (done[0] - began) / 1_000_000.0 if done else 0.0
+	var worst := func(list: Array) -> float: return list.max() / 1000.0 if list else INF
+	print("CONTENT 16 MB over loopback in %.2f s (%.1f MB/s); lobby messages at worst %.1f ms, checksums %.1f ms late" % [seconds, 16.0 / seconds if seconds > 0 else 0.0, worst.call(config_late), worst.call(event_late)])
+	check(done.size() == 1 and FileAccess.get_file_as_bytes(gc.path_for(item.hash)) == bytes, "A 16 MB item arrives whole (%.1f s)" % seconds)
+	check(most_in_flight[0] <= LocalNetContent.WINDOW, "No more than %d chunks are ever in flight (%d)" % [LocalNetContent.WINDOW, most_in_flight[0]])
+	check(config_late.size() >= 3 and worst.call(config_late) < 25.0, "Lobby messages arrive at once during the transfer (%d, at worst %.1f ms)" % [config_late.size(), worst.call(config_late)])
+	check(event_late.size() >= 3 and worst.call(event_late) < 25.0, "So do checksums (%d, at worst %.1f ms)" % [event_late.size(), worst.call(event_late)])
+	for c in [hc, gc]:
+		c.close()
+	for l in pair:
+		l.leave()
