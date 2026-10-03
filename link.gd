@@ -1,11 +1,12 @@
 class_name LocalNetLink
 extends RefCounted
-## A thin wrapper over ENet: one host, any number of clients, three channels, and
+## A thin wrapper over ENet: one host, any number of clients, four channels, and
 ## connections that survive a drop.
 ##
 ## Channels: [constant CHANNEL_CONTROL] carries reliable lobby messages,
-## [constant CHANNEL_REALTIME] unreliable per-frame traffic (inputs, clock pings) and
-## [constant CHANNEL_EVENTS] reliable binary events (checksums). Binary packets start with
+## [constant CHANNEL_REALTIME] unreliable per-frame traffic (inputs, clock pings),
+## [constant CHANNEL_EVENTS] reliable binary events (checksums) and
+## [constant CHANNEL_CONTENT] reliable content transfers ([LocalNetContent]). Binary packets start with
 ## a kind byte so several listeners can share a channel. The host is always peer
 ## [constant HOST_ID]; clients are numbered from 2 on the host.
 ##
@@ -33,7 +34,7 @@ signal received(id: int, channel: int, bytes: PackedByteArray)
 ## The first connection attempt failed.
 signal connect_failed
 
-enum { CHANNEL_CONTROL, CHANNEL_REALTIME, CHANNEL_EVENTS, CHANNEL_COUNT }
+enum { CHANNEL_CONTROL, CHANNEL_REALTIME, CHANNEL_EVENTS, CHANNEL_CONTENT, CHANNEL_COUNT }
 const HOST_ID := 1
 ## Codes sent with a disconnect, so the other side knows it was deliberate.
 enum { BYE_NONE, BYE_LEAVE, BYE_KICK, BYE_FORGOTTEN }
