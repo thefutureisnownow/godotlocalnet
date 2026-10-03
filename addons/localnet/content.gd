@@ -102,6 +102,7 @@ func close() -> void:
 
 
 ## An item for [param source]: a [PackedByteArray] or a file path. Hashes the whole thing.
+## Empty if the file can't be read.
 static func describe(type: String, id: String, source: Variant) -> Dictionary:
 	var hashing := HashingContext.new()
 	hashing.start(HashingContext.HASH_SHA256)
@@ -421,7 +422,8 @@ func _on_received(id: int, channel: int, bytes: PackedByteArray) -> void:
 	var hash := bytes.slice(1, 33).hex_encode()
 	var kind := bytes[0]
 	if kind == KIND_NOPE:
-		_on_nope(id, hash, bytes[33])
+		if bytes.size() > 33:
+			_on_nope(id, hash, bytes[33])
 		return
 	if bytes.size() < _HEADER:
 		return
@@ -446,7 +448,7 @@ func _on_want(id: int, hash: String, offset: int) -> void:
 func _on_chunk(id: int, hash: String, offset: int, data: PackedByteArray) -> void:
 	var fetch: Dictionary = _fetches.get(hash, {})
 	# Only items this device asked for, from the device it asked.
-	if fetch.is_empty() or fetch.state != "fetching" or fetch.from != id:
+	if fetch.is_empty() or fetch.state != "fetching" or fetch.from != id or data.is_empty():
 		return
 	if offset < fetch.offset:
 		_send_ack(id, hash, offset)

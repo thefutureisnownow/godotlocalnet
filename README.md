@@ -17,19 +17,24 @@ git subtree pull --prefix=addons/localnet https://github.com/stained/godotlocaln
 
 Change LocalNet here, never in a game's copy. After the tests pass, bump `addons/localnet/VERSION`, commit, and run `tools/publish_addon.sh` to update the `addon` branch.
 
+**Updating a game to 0.3:** bump the game's own protocol version (the `version` it gives `LocalNetDiscovery` and `LocalNetLobby`, such as Snoek'em's `PROTOCOL`), even if no game code changes. 0.3 adds a fourth ENet channel, and its lobby `hello` carries LocalNet's own wire version (`"ln": 3`). A 0.3 host turns away a guest without it, or with another one, as "Different LocalNet version", but a 0.2 host ignores it and would let a 0.3 guest in. Bumping the game's version keeps old and new builds apart on both sides, and discovery lists the other build as incompatible.
+
 ## The addon
 
 | Class | Job |
 |---|---|
 | `LocalNetDiscovery` | Hosts answer UDP probes on port 47650, or the first free of 47651–47653 when another host on the same device has it. Scanners probe every address in each local IPv4 /24, plus broadcast where allowed, and list the hosts that reply. A scan can also target one typed address, which finds its game port. |
-| `LocalNetLink` | A thin ENet wrapper with one host, any number of clients and three channels: reliable control, unreliable real-time and reliable events. The game port is chosen by the system or by the host. Dropped connections reconnect under the same id (see below). It can simulate loss, latency, jitter, hiccups and dropped connections for tests. |
-| `LocalNetLobby` | Join, reject (wrong game, version or code, or a full lobby), the member list, per-player data, shared settings, ready flags, clock sync, link quality and `suggested_delay()`. It can wait until everyone has loaded before a synchronized start, and returns to the lobby for rematches. |
-| `LocalNetInputSync` | Lockstep input exchange with input delay. Packets resend everything that hasn't been acknowledged, so losses cost nothing. The host relays when there are more than two players. It also offers checksum desync detection, and `predicted_inputs()` as the first building block for rollback. |
+| `LocalNetLink` | A thin ENet wrapper with one host, any number of clients and four channels: reliable control, unreliable real-time, reliable events and reliable content. The game port is chosen by the system or by the host. Dropped connections reconnect under the same id (see below). It can simulate loss, latency, jitter, hiccups and dropped connections for tests. |
+| `LocalNetLobby` | Join, reject (wrong game, version or code, or a full lobby), the member list, players and spectators, per-player data, shared settings, ready flags, clock sync, link quality and `suggested_delay()`. It can wait until everyone has loaded before a synchronized start, and returns to the lobby for rematches. The host can also stay out of the match and only relay (see below). |
+| `LocalNetInputSync` | Lockstep input exchange with input delay. Packets resend everything that hasn't been acknowledged, so losses cost nothing. The host relays when there are more than two players, and to spectators. It also offers checksum desync detection, and `predicted_inputs()` as the first building block for rollback. |
 | `LocalNetLockstep` | The per-frame loop: which ticks are due, sampling input ahead, stepping, checksums and freeing old inputs. After a stall it moves its schedule back instead of racing through the backlog, and it reports who it's waiting on. Time sync keeps devices' schedules together after hiccups or a misjudged clock offset (see below). |
+| `LocalNetContent` | Moves content (stages, skins, mods) between lobby members by hash before a match, so everyone holds the same bytes (see below). |
 | `LocalNetWifiRoute` | On Android, binds the game's sockets to Wi-Fi (see Platform notes); elsewhere it does nothing. Call `bind()` before hosting, scanning or joining, and `release()` on leaving. |
 | `LocalNetLatencyStats` | Measures how late remote inputs arrive, how often a given input delay would stall, and how deep rollback would need to go. |
 
-Everything is poll-driven `RefCounted` objects, with no autoloads, RPCs or scene-tree multiplayer. Call `poll()` on the discovery and lobby at the start of each frame.
+Everything is poll-driven `RefCounted` objects, with no autoloads, RPCs or scene-tree multiplayer. Call `poll()` on the discovery and lobby (and content, if used) at the start of each frame.
+
+How a game keeps its devices' state the same is up to the game. Discovery, the lobby, the link and content get everyone into a match together, and work the same whatever happens in it. `LocalNetInputSync` and `LocalNetLockstep` are optional helpers for games that choose lockstep; a game that sends its own state snapshots over the link uses neither.
 
 ```gdscript
 var discovery := LocalNetDiscovery.new("snoekem", 1)
@@ -44,7 +49,7 @@ lobby.start()
 
 lobby.preparing.connect(func(config): load_fight(config); lobby.mark_loaded())
 lobby.started.connect(func(config, start_usec):
-	var sync := LocalNetInputSync.new(lobby.link, lobby.members.size(), lobby.local_slot(), lobby.peer_slots(), config.delay, 2)
+	var sync := LocalNetInputSync.new(lobby.link, lobby.players().size(), lobby.local_slot(), lobby.peer_slots(), config.delay, 2)
 	lockstep = LocalNetLockstep.new(sync, start_usec, 120, read_pad, step_fight, hash_fight))
 # Every frame: lockstep.advance(). After the match the host calls lobby.return_to_lobby().
 ```
@@ -55,17 +60,17 @@ Discovery is JSON over UDP, so it stays readable and language-neutral:
 
 ```
 probe: {"localnet":"probe","game":"snoekem","v":1,"sent":<usec>}
-reply: {"localnet":"host","game":…,"v":…,"sent":<echoed>,"id":…,"name":…,"port":<game port>,"players":…,"max":…,"state":…,"code":<bool>}
+reply: {"localnet":"host","game":…,"v":…,"sent":<echoed>,"id":…,"name":…,"port":<game port>,"players":…,"max":…,"spectators":…,"max_spectators":…,"state":…,"code":<bool>}
 ```
 
 Lobby messages travel on ENet channel 0 (reliable) as Godot variants: `var_to_bytes` of a Dictionary, decoded without objects. Integers, floats and vectors keep their types.
 
 | Message | Direction |
 |---|---|
-| `hello` | guest → host |
+| `hello` | guest → host: game, version, `"ln"` (LocalNet's wire version, 3), `"role"` (`"player"` or `"spectator"`), name, code |
 | `welcome` / `reject` | host → guest |
-| `member` | guest → host |
-| `lobby`, `prepare`, `start`, `return` | host → everyone |
+| `member` | guest → host: ready, synced, loaded, data, net, `"content"` (`{"need", "missing"}`) |
+| `lobby`, `prepare`, `start`, `return` | host → everyone. `lobby` carries the members (each with a `"role"`), and `"content"` once the host has required some. |
 
 Match traffic is binary and little-endian. The first byte of every packet is a kind code, so several listeners can share a channel.
 
@@ -85,6 +90,15 @@ INPUTS    ch1 unreliable
 ```
 
 Each INPUTS packet repeats every tick the receiver hasn't acknowledged, up to 32 per slot. For two players with 2-byte inputs, a typical packet is 27–32 bytes, plus about 45 bytes of ENet, UDP and IP headers.
+
+Content travels on its own reliable channel, with the item's sha256 as 32 raw bytes:
+
+```
+WANT   ch3 reliable  [14][hash: 32 bytes][offset: u32]         37 bytes
+CHUNK  ch3 reliable  [15][hash: 32 bytes][offset: u32][bytes]  up to 37 + 16,384 bytes
+ACK    ch3 reliable  [16][hash: 32 bytes][offset: u32]         37 bytes
+NOPE   ch3 reliable  [17][hash: 32 bytes][reason: u8]          34 bytes   1: don't have it, 2: nobody has it, 3: can't read it
+```
 
 ## Dropped connections
 
@@ -126,9 +140,11 @@ In a simulation of that third match (a 68 fps host, a 120 fps guest 25 ms ahead,
 
 `suggested_delay()` picks an input delay long enough for an input to reach the other device before it's due there. An input can be sampled up to a frame late, since devices only sample on frames, and noticed up to a frame late at the other end. So the delay is:
 
-- half the slowest member's typical (75th-percentile) round trip, which already includes the average quarter of each end's frame;
-- three quarters of the two slowest members' frame times;
+- half the slowest player's typical (75th-percentile) round trip, which already includes the average quarter of each end's frame;
+- three quarters of the two slowest players' frame times;
 - a 3 ms margin.
+
+Spectators' round trips and frames are left out. When the host doesn't play, every input crosses two links (guest → host → guest), so the first term becomes half of each of the two slowest players' round trips, plus the host's whole frame, since it relays once a frame. With three or more players and a host that plays, guests' inputs to each other are relayed too, and the formula, which counts one link, probably comes out short; it is left as it is for now, since Snoek'em plays two.
 
 Guests ping the host about 60 times a second in the lobby, as often as a match sends inputs. Phones put a quiet Wi-Fi radio into power save, where packets wait for a beacon or three (100–300 ms), and only wake it fully for steady traffic. At four or ten pings a second the radio napped. The first match on the A22 and A25 was judged from slow pings (6 to 12 ticks, where rematches got 4), and it still stalled for about a second in total as the radio woke. At 60 a second, first matches start with no stalls at all. Round trips from the first second after joining are left out while the radio wakes, and the last two seconds' worth are kept. A guest only counts as synced, so the host can only start, once half a second of round trips has been measured after that: about 1.5 s after joining. Round trips that waited on a frame of more than 50 ms at either end are left out too: a host loading its next screen answers pings only between long frames, and on the A22 that made a first match's round trips look like 300–500 ms. Each pong says how long the host's last frame took for this.
 
@@ -140,6 +156,71 @@ A 400 ms hiccup over loopback shows the difference:
 |---|---|---|
 | Without time sync | 30.7 / −9.9 ms | 13% |
 | With time sync | 14.0 / 7.4 ms | 4% (the hiccup itself) |
+
+## Players and spectators
+
+Every member has a role in the lobby, `"player"` or `"spectator"`. Roles are a lobby matter only: they don't depend on how the game syncs its state.
+
+| Setting or call | Effect |
+|---|---|
+| `lobby.max_spectators` | How many guests may join to watch. 0 by default, which turns them away ("Spectators aren't allowed"); past the limit it's "No room for spectators". Set it before `host()`, since the link makes room for them then. |
+| `lobby.join(address, port, name, code, "spectator")` | Joins to watch. Spectators must join before the match starts. |
+| `lobby.host(name, players, code, port, false)` | The host doesn't play: its member is a spectator and `players` guests play. For a PC driving a big screen or Tilt Five glasses while phones play. |
+| `players()`, `spectators()`, `is_spectator(id)` | Member ids by role, and whether a member watches. A host that doesn't play is among the spectators. |
+| `advert()` | `players` counts players only; `spectators` and `max_spectators` are new, and discovery's sessions carry them. |
+
+Spectators have slot −1 and never hold up players. They don't count towards `max_players`, the two players `can_start()` needs, `start()`'s slot numbering or `suggested_delay()`. They need no ready flag, no content (they can't follow a match without it, but the players needn't wait), and the start doesn't wait for a spectator whose connection has dropped. The one thing a spectator must have to be started with is a synced clock, which takes about 1.5 s after joining: without it, its start time would be a guess.
+
+A navigator or co-driver isn't a role. Anything that changes the game has to reach every device, so in lockstep a co-driver is just another player slot whose input means something else; the game says so in member data.
+
+**In the lockstep helpers**, a spectator follows the match from relayed inputs:
+
+- The host's `peer_slots()` maps spectators to −1, and `LocalNetInputSync` relays every slot to them the way it relays to players. A device with no slot (a spectator, or a host that doesn't play) passes `own_slot = -1` and never samples input.
+- Spectators never slow players. The host leaves them out of time sync (`timing_peers()`), and `waiting_on()` only names slots, which spectators don't have.
+- A spectating guest hears every input second-hand, so its runner stays `spectator_lag_ticks` (4) behind the shared schedule to ride out the extra hop. After a stall it eases back in like everyone else, then catches up, running at most `catch_up_rate` (25%) faster and only as far as the inputs it holds allow. A host that doesn't play hears every input first-hand and runs on the schedule.
+- The host keeps inputs until every peer has confirmed them. A spectator that falls more than `keep_ticks` (240) behind would keep them forever, so the host stops sending to it and emits `spectator_dropped(id)`. What happens next is the game's choice.
+- Spectators report checksums like anyone else, and a mismatch emits `desynced(tick, peer_id)` as before; the game decides what a spectator's desync means. The link test app reports it and the players carry on.
+
+In the link test app, a spectator with a 40 ms, 20 ms-jitter link to the host followed a match 23.5 ms behind the schedule on average (35.5 ms at most), with no stalls, while the two players stalled on no frames at all.
+
+## Content
+
+`LocalNetContent` moves blobs between lobby members before a match, so everyone has the same stage, skin or mod. It carries bytes only: the game packs its content (with `ZIPPacker`, say) and loads what arrives itself. It needs only the lobby and its link, whatever kind of match follows.
+
+```gdscript
+var content := LocalNetContent.new(lobby)
+var reef := LocalNetContent.describe("stage", "reef", "user://stages/reef.zip")   # {type, id, hash, size}
+content.offer(reef, "user://stages/reef.zip")   # a path, bytes, or (offset, length) -> bytes
+content.require([reef])                          # host: what the match needs
+content.received.connect(func(item, path): install(item, path))
+# Every frame, after lobby.poll(): content.poll(). The host starts once lobby.can_start(false, true).
+```
+
+Items are matched by their sha256, never their id: a different version under the same id counts as missing, since devices running different content would drift apart. Every member hears what's required with the member list, fetches what it lacks and reports how many items are still missing under its member's `"content"` key, and `can_start(require_ready, require_content)` can wait for that. Guests fetch from the host. When only a guest has an item, the host fetches it from that guest, keeps it and passes it on, so content travels in a star like everything else.
+
+| Setting, call or signal | Effect |
+|---|---|
+| `offer(item, source)`, `require(items)` | What this device can serve; what the match needs (host). |
+| `has(hash)`, `path_for(hash)`, `missing()` | What this device holds, and where. |
+| `cache_dir` | `user://localnet_content/` by default. Downloads are `<hash>`, partial ones `<hash>.part`. |
+| `max_item_bytes` | 32 MB by default; bigger items are never asked for. Raise it for large mods. |
+| `budget_bytes` | Bytes of chunks sent per frame, 128 KB by default. |
+| `progress(hash, bytes, total)`, `received(item, path)`, `failed(item, reason)`, `all_present` | Reasons for failing are "Nobody has it", "Too big", "Didn't match its hash" and "Couldn't be read". |
+
+Transfers have their own reliable channel. ENet's reliable window (64 KB) is shared by all of a peer's channels, so a big backlog of chunks would hold up lobby messages and checksums behind it. Each peer therefore gets at most 4 unacknowledged 16 KB chunks, and the sender keeps to `budget_bytes` a frame. Transfers only run in the lobby: they pause when a match is preparing or playing and carry on when everyone returns. A partial download carries on from its `.part` file after a dropped connection, a rematch or a restart of the app. A finished one is checked against its hash before it's renamed into place; one that doesn't match is thrown away. A device only accepts chunks of items it asked for, from the device it asked, and only serves items it offered (the host also serves required items it has fetched).
+
+**Never load downloaded content through `ResourceLoader`** (`load()`, `ResourceLoader.load()` or a scene that references it). `.tres`, `.res` and `.tscn` files can embed scripts, which would run with the game's permissions. Read downloads as data: `GLTFDocument` for models, `Image.load_from_buffer()` for images, `JSON` for settings, and `ZIPReader` to unpack.
+
+Over loopback, with both ends polling every 8.3 ms (120 fps), a 16 MB item moved at 6.2 MB/s and checksums sent meanwhile arrived 4.9 ms late typically (10 ms at worst), as they do with no transfer. Throughput is about four chunks per frame:
+
+| Chunk, chunks in flight | 120 fps | 60 fps | Checksums late, 60 fps (typical / worst) |
+|---|---|---|---|
+| 8 KB, 4 | 3.6 MB/s | 1.8 MB/s | 13.7 / 17.3 ms |
+| 16 KB, 4 (chosen) | 6.2 MB/s | 3.2 MB/s | 15.8 / 18.5 ms |
+| 16 KB, 16 | 7.0 MB/s | 3.6 MB/s | 50 / 68 ms |
+| 16 KB, no limit | 7.0 MB/s | 3.6 MB/s | 1,158 / 2,286 ms |
+
+In the link test app, 100 MB in a single item went across loopback in 12.8 s (7.8 MB/s), and in 13 items of up to 8 MB in 14.0 s (7.2 MB/s).
 
 ## Ports
 
@@ -175,6 +256,11 @@ Command-line options, after `--`:
 |---|---|
 | `--host` | Host a session, starting when enough players have joined |
 | `--join[=address[:port]]` | Join the first session found, or a given address |
+| `--spectate[=address[:port]]` | Join to watch. The results show how far behind the schedule it ran. |
+| `--spectators=N` | The host waits for N spectators before starting |
+| `--organiser` | The host doesn't play; `--players` guests do |
+| `--content=MB`, `--content-item=MB` | The host makes up MB of random content, in items of up to 8 MB (or the given size), and starts once every player has fetched it. Guests report the throughput. |
+| `--desync=TICK` | This device's game goes wrong at TICK, to show what a desync does |
 | `--name=` | Player name |
 | `--port=N` | Host on a fixed game port |
 | `--delay=N` | Fixed input delay in ticks (default: automatic) |
@@ -199,8 +285,8 @@ godot --headless --path . -- --join=127.0.0.1 --quit
 ## Tests
 
 ```sh
-godot --headless --path . --script tests/test_localnet.gd   # 180 checks, about 100 s
-godot --headless --path . --script tests/test_demo.gd       # 29 checks, about 130 s
+godot --headless --path . --script tests/test_localnet.gd   # 307 checks, about 2½ minutes
+godot --headless --path . --script tests/test_demo.gd       # 41 checks, about 3 minutes
 ```
 
 `test_localnet.gd` runs hosts and clients side by side over loopback. A pair of input syncs wired together in memory lets the lockstep rules be checked tick by tick. It covers:
@@ -234,6 +320,21 @@ godot --headless --path . --script tests/test_demo.gd       # 29 checks, about 1
   - a guest catching up on settings and a start it missed;
   - the host's window reaching guests, waiting forever, giving up from either side, and a window of 0;
   - a lockstep match surviving an 800 ms drop with identical inputs on both sides.
+- **Spectators and roles:**
+  - spectators turned away by default and past the limit, and not taking players' places;
+  - players and spectators counted apart in `can_start()`, the advert, slot numbering and the suggested delay;
+  - a host that doesn't play starting two guests' lockstep match, identical inputs and checksums on all three devices, over a clean and a lossy link;
+  - a spectator following a lockstep match;
+  - a slow spectator (20 fps, 120 ms away) never stalling the players or easing their schedules, and a late one catching up;
+  - a spectator that stops confirming being dropped once `keep_ticks` behind;
+  - a guest of another LocalNet version turned away.
+- **Content:**
+  - offer and require, `can_start(false, true)`, and cached content not fetched again;
+  - an item only a guest has, passed on through the host;
+  - bytes that don't match their hash thrown away;
+  - a transfer carrying on after a dropped connection, pausing for a match, and resuming from its partial file in a new session;
+  - the size limit, chunks nobody asked for, and items nobody offered;
+  - a 16 MB transfer with at most 4 chunks in flight, while lobby messages and checksums arrive at once.
 - **Other:** desync detection, players leaving, and the statistics maths.
 
 `test_demo.gd` launches the link test app as separate host and guest processes and reads the results they save:
@@ -245,6 +346,9 @@ godot --headless --path . --script tests/test_demo.gd       # 29 checks, about 1
 - three players;
 - a 400 ms hiccup with and without time sync;
 - a 1.5 s dropped connection mid-match, and one longer than the host's window;
+- a spectator on a slow link whose own desync doesn't end the players' match, and who doesn't stall them;
+- a host that doesn't play, with two guests;
+- 8 MB of content fetched before a match;
 - every process quitting on its own.
 
 ## Measurements (2026-09-28)
