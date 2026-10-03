@@ -169,7 +169,7 @@ Every member has a role in the lobby, `"player"` or `"spectator"`. Roles are a l
 | `players()`, `spectators()`, `is_spectator(id)` | Member ids by role, and whether a member watches. A host that doesn't play is among the spectators. |
 | `advert()` | `players` counts players only; `spectators` and `max_spectators` are new, and discovery's sessions carry them. |
 
-Spectators have slot −1 and never hold up players. They don't count towards `max_players`, the two players `can_start()` needs, `start()`'s slot numbering or `suggested_delay()`. They need no ready flag, no content (they can't follow a match without it, but the players needn't wait), and the start doesn't wait for a spectator whose connection has dropped. The one thing a spectator must have to be started with is a synced clock, which takes about 1.5 s after joining: without it, its start time would be a guess.
+Spectators have slot −1 and don't hold up players. They don't count towards `max_players`, the two players `can_start()` needs, `start()`'s slot numbering or `suggested_delay()`. They need no ready flag and no content (they can't follow a match without it, but the players needn't wait). Two things still wait for a spectator, both in the lobby and never mid-match: `can_start()` waits for its clock to be synced (about 1.5 s after joining; without it, its start time would be a guess), and with `wait_for_loading` the start waits for it to load, so it can follow from the first tick, unless its connection has dropped.
 
 A navigator or co-driver isn't a role. Anything that changes the game has to reach every device, so in lockstep a co-driver is just another player slot whose input means something else; the game says so in member data.
 
@@ -286,7 +286,7 @@ godot --headless --path . -- --join=127.0.0.1 --quit
 
 ```sh
 godot --headless --path . --script tests/test_localnet.gd   # 307 checks, about 2½ minutes
-godot --headless --path . --script tests/test_demo.gd       # 41 checks, about 3 minutes
+godot --headless --path . --script tests/test_demo.gd       # 41 checks, about 2½ minutes
 ```
 
 `test_localnet.gd` runs hosts and clients side by side over loopback. A pair of input syncs wired together in memory lets the lockstep rules be checked tick by tick. It covers:
