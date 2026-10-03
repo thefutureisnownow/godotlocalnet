@@ -26,6 +26,9 @@ func run() -> void:
 	hiccup()
 	dropped_connection()
 	reconnect_window()
+	spectator()
+	organiser()
+	content()
 	print("LOCALNET DEMO: %d checks, %d failures" % [checks, failures.size()])
 	for failure in failures:
 		print("  FAIL ", failure)
@@ -138,3 +141,34 @@ func reconnect_window() -> void:
 	# A drop longer than the window the host chose ends the match on both devices.
 	var results := play(["--host", "--name=Host", "--seconds=10", "--reconnect=2"], [["--join", "--loopback", "--name=Guest", "--drop-connection=4000"]])
 	check(results.size() == 2 and count(results, "lost their connection") == 1 and count(results, "Lost connection to the host") == 1, "A drop longer than the host's 2 s window ends the match for both")
+
+
+# A spectator on a slow link watches a match, goes wrong on purpose at tick 300, and the
+# players carry on regardless.
+func spectator() -> void:
+	var results := play(["--host", "--name=Host", "--seconds=4", "--spectators=1"], [["--join", "--loopback", "--name=Guest"], ["--spectate", "--loopback", "--name=Watcher", "--latency=40", "--jitter=20", "--desync=300"]])
+	var watcher := results.filter(func(r): return r.contains("· spectator ·"))
+	var players := results.filter(func(r): return not r.contains("· spectator ·"))
+	check(results.size() == 3 and count(results, "Finished") == 3, "Two players and a spectator finish the match")
+	check(players.size() == 2 and players.all(func(r): return r.contains("no desync")), "The players stay in sync")
+	check(watcher.size() == 1 and watcher[0].contains("DESYNC first at tick 360") and watcher[0].contains("Spectator lag"), "The spectator notices its own desync and reports its lag")
+	check(count(players, "desyncs: Watcher at tick 360") == 1, "The host reports the spectator's desync without ending the match")
+	var stalls := RegEx.create_from_string("Stalled frames \\d+ of \\d+ \\(([0-9.]+)%\\)")
+	check(players.all(func(r): var m := stalls.search(r); return m != null and float(m.get_string(1)) < 2.0), "A slow spectator doesn't stall the players")
+
+
+# A host that doesn't play relays two guests' inputs.
+func organiser() -> void:
+	var results := play(["--host", "--organiser", "--name=Screen", "--seconds=3"], [["--join", "--loopback", "--name=One"], ["--join", "--loopback", "--name=Two"]])
+	check(results.size() == 3 and count(results, "Finished") == 3 and count(results, "no desync") == 3, "An organiser host and two players finish in sync")
+	check(count(results, "· host · slot -1 of 2") == 1 and count(results, "· guest · slot") == 2, "The host has no slot and the guests play")
+
+
+# The host requires 8 MB of random blobs; the guest fetches them before the match starts.
+func content() -> void:
+	var results := play(["--host", "--name=Host", "--seconds=2", "--content=8", "--content-item=2"], [["--join", "--loopback", "--name=Guest"]])
+	check(results.size() == 2 and count(results, "Finished") == 2, "A match with required content finishes")
+	var fetched := RegEx.create_from_string("Content: fetched 4 items, 8.0 MB in [0-9.]+ s \\(([0-9.]+) MB/s\\)")
+	var m := fetched.search("\n".join(results))
+	print("CONTENT demo: %s" % (m.get_string(0) if m else "no transfer reported"))
+	check(m != null and float(m.get_string(1)) > 0.5, "The guest fetched it all first and reports the throughput")

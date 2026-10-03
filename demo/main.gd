@@ -6,7 +6,8 @@ extends Control
 # Command-line options (after --): --host, --join[=address[:port]], --name=NAME,
 # --delay=N (default auto), --seconds=N, --players=N, --matches=N, --free, --port=N,
 # --reconnect=SECONDS|forever|off, --drop=0.1, --latency=MS, --jitter=MS, --hiccup=MS, --drop-connection=MS,
-# --no-time-sync, --loopback, --results=DIR, --quit.
+# --no-time-sync, --loopback, --results=DIR, --quit, --spectate[=address[:port]], --spectators=N,
+# --organiser, --content=MB, --content-item=MB, --desync=TICK.
 
 const GAME := "localnet-linktest"
 const VERSION := 5
@@ -33,6 +34,10 @@ var settings := {"delay": 3, "auto_delay": true, "seconds": 60, "players": 2, "m
 var matches_played := 0
 var joining_address := ""
 var joining_since := 0
+var join_role := LocalNetLobby.PLAYER
+var roles := {}
+var content: LocalNetContent
+var content_stats := {}
 
 # Test run.
 var run := {}
@@ -78,16 +83,19 @@ func _ready() -> void:
 	show_home()
 	if options.has("host"):
 		start_hosting()
-	elif options.has("join"):
-		show_join()
-		if options.join != "1":
-			join_address(options.join)
+	elif options.has("join") or options.has("spectate"):
+		var target: String = options.get("join", options.get("spectate"))
+		show_join(LocalNetLobby.SPECTATOR if options.has("spectate") else LocalNetLobby.PLAYER)
+		if target != "1":
+			join_address(target)
 
 
 func _process(_dt: float) -> void:
 	discovery.poll()
 	if lobby:
 		lobby.poll()
+		if content:
+			content.poll()
 		if lobby and lobby.is_host and discovery.advertised_port:
 			discovery.update_info(lobby.advert())
 	match screen:
@@ -167,6 +175,7 @@ func show_home() -> void:
 	port_edit = field("Game port (blank: any free port)", options.get("port", ""), buttons)
 	button("Host", start_hosting, buttons).custom_minimum_size.x = 200
 	button("Join", show_join, buttons).custom_minimum_size.x = 200
+	button("Watch", func(): show_join(LocalNetLobby.SPECTATOR), buttons).custom_minimum_size.x = 200
 	text("This device: " + describe_addresses())
 
 
@@ -183,13 +192,16 @@ func start_hosting() -> void:
 	leave()
 	LocalNetWifiRoute.bind()
 	lobby = new_lobby()
-	var err := lobby.host(player_name(), settings.players, "", port)
+	lobby.max_spectators = maxi(4, int(options.get("spectators", 0)))
+	var err := lobby.host(player_name(), settings.players, "", port, not options.has("organiser"))
 	if err != OK:
 		show_home()
 		text("Couldn't host on port %d: %s" % [port, error_string(err)])
 		return
 	lobby.set_config(settings)
 	lobby.reconnect_window_msec = reconnect_msec()
+	if options.has("content"):
+		offer_content(float(options.content))
 	discovery.advertise(lobby.advert())
 	show_host()
 
@@ -221,7 +233,7 @@ func show_host() -> void:
 
 
 func start_test() -> void:
-	if not lobby.can_start():
+	if not lobby.can_start(false, content != null):
 		return
 	if settings.auto_delay:
 		settings.delay = lobby.suggested_delay(TICK_RATE)
@@ -292,7 +304,7 @@ func refresh_members() -> void:
 	ids.sort()
 	for id in ids:
 		var member: Dictionary = lobby.members[id]
-		var line := "%s  (slot %d)" % [member.name, member.slot]
+		var line := "%s  (%s)" % [member.name, "watching" if lobby.is_spectator(id) else "slot %d" % member.slot]
 		if id == lobby.local_id:
 			line += "  · you"
 		var net: Dictionary = member.get("net", {})
@@ -302,12 +314,16 @@ func refresh_members() -> void:
 			line += "  · %.0f fps" % (1_000_000.0 / net.frame_usec)
 		if not member.synced:
 			line += "  · syncing clock"
+		if member.get("content", {}).get("missing", 0) > 0:
+			line += "  · fetching %d items" % member.content.missing
 		var label := Label.new()
 		label.text = line
 		list_box.add_child(label)
 	var config := settings if lobby.is_host else lobby.config
 	var delay_text := delay_label() if lobby.is_host else str(config.get("delay", "?"))
 	var summary := "%s · input delay %s · %d s · up to %d players" % [config.get("mode", "lockstep"), delay_text, config.get("seconds", 60), config.get("players", 2)]
+	if content and not lobby.needed_content.is_empty():
+		summary += "\nContent: %s" % content_line()
 	if config.get("mode") == "free-run":
 		summary += "\nFree-run never waits: missing inputs repeat the last one, like rollback before it corrects. It measures the network alone."
 	if status_label and is_instance_valid(status_label):
@@ -317,18 +333,19 @@ func refresh_members() -> void:
 		var b := box.find_child(name, true, false)
 		if b:
 			b.text = labels[name]
-	if lobby.is_host and options.has("host") and screen == "host" and lobby.can_start() and lobby.members.size() >= settings.players:
+	if lobby.is_host and options.has("host") and screen == "host" and lobby.can_start(false, content != null) and lobby.players().size() >= settings.players and lobby.advert().spectators >= int(options.get("spectators", 0)):
 		start_test.call_deferred()
 
 
 # Joining.
 
-func show_join() -> void:
+func show_join(role := LocalNetLobby.PLAYER) -> void:
 	player_name()
 	leave()
+	join_role = role
 	screen = "join"
 	clear()
-	heading("Join")
+	heading("Watch" if role == LocalNetLobby.SPECTATOR else "Join")
 	status_label = text("Looking for hosts…")
 	list_box = VBoxContainer.new()
 	box.add_child(list_box)
@@ -365,7 +382,7 @@ func refresh_sessions() -> void:
 		var b := button(label, func(): connect_to(session.address, session.port), list_box)
 		b.disabled = not session.compatible or session.state != "lobby"
 	status_label.text = ("Looking for hosts…" if sessions.is_empty() else "Tap a host to join.") + "  (%d probes a sweep, longest frame %.1f ms)" % [discovery.last_sweep_targets, discovery.last_sweep_usec / 1000.0]
-	if options.has("join") and options.join == "1" and not sessions.is_empty() and sessions[0].compatible:
+	if options.get("join", options.get("spectate", "")) == "1" and not sessions.is_empty() and sessions[0].compatible:
 		connect_to(sessions[0].address, sessions[0].port)
 
 
@@ -389,7 +406,8 @@ func connect_to(address: String, port: int) -> void:
 	discovery.stop_scanning()
 	LocalNetWifiRoute.bind()
 	lobby = new_lobby()
-	lobby.join(address, port, player_name())
+	lobby.join(address, port, player_name(), "", join_role)
+	content = new_content()
 	show_guest_lobby("Joining %s:%d" % [address, port], "Connecting…")
 
 
@@ -413,12 +431,17 @@ func new_lobby() -> LocalNetLobby:
 	l.link.debug_latency_msec = float(options.get("latency", 0))
 	l.link.debug_jitter_msec = float(options.get("jitter", 0))
 	l.members_changed.connect(refresh_members)
+	l.members_changed.connect(func():
+		for id in l.members:
+			roles[id] = l.members[id].get("role", LocalNetLobby.PLAYER))
 	l.preparing.connect(on_preparing)
 	l.started.connect(begin_test)
 	l.returned.connect(on_returned)
 	l.rejected.connect(func(reason): status_label.text = "Turned away: " + reason)
 	l.closed.connect(on_closed)
-	l.member_left.connect(func(_id, reason): end_test("A player left" if reason == "left" else "A player lost their connection"))
+	l.member_left.connect(func(id, reason):
+		if roles.get(id) != LocalNetLobby.SPECTATOR:
+			end_test("A player left" if reason == "left" else "A player lost their connection"))
 	l.member_interrupted.connect(func(_id): refresh_members())
 	l.member_resumed.connect(on_resumed)
 	l.connection_interrupted.connect(show_reconnecting)
@@ -462,6 +485,9 @@ func on_closed(reason: String) -> void:
 func leave() -> void:
 	discovery.stop()
 	stop_sync()
+	if content:
+		content.close()
+	content = null
 	if lobby:
 		lobby.leave()
 	lobby = null
@@ -479,10 +505,11 @@ func stop_sync() -> void:
 # The test itself: a deterministic toy where each player slides along a lane.
 
 func begin_test(config: Dictionary, start_usec: int) -> void:
-	var players := lobby.members.size()
+	var players := lobby.players().size()
 	var delay := int(config.get("delay", 3))
 	sync = LocalNetInputSync.new(lobby.link, players, lobby.local_slot(), lobby.peer_slots(), delay, INPUT_BYTES)
 	runner = LocalNetLockstep.new(sync, start_usec, TICK_RATE, sample_input, simulate, checksum)
+	sync.spectator_dropped.connect(func(id): run.spectators_dropped.append(lobby.members.get(id, {}).get("name", "a spectator")))
 	runner.predict = config.get("mode") == "free-run"
 	runner.time_sync = not options.has("no-time-sync")
 	stats = LocalNetLatencyStats.new(TICK_RATE)
@@ -493,10 +520,11 @@ func begin_test(config: Dictionary, start_usec: int) -> void:
 	for slot in players:
 		positions[slot] = LANE_WIDTH >> 1
 	bot.seed = hash(player_name()) + lobby.local_slot()
-	run = {"delay": delay, "total": int(config.get("seconds", 60)) * TICK_RATE, "players": players, "desync_tick": -1, "checksums": 0, "reconnections": 0, "began_usec": Time.get_ticks_usec()}
+	run = {"delay": delay, "total": int(config.get("seconds", 60)) * TICK_RATE, "players": players, "desync_tick": -1, "checksums": 0, "reconnections": 0, "began_usec": Time.get_ticks_usec(), "spectator_desyncs": [], "spectators_dropped": [], "lag_usec": 0, "lag_frames": 0, "most_lag_usec": 0}
 	screen = "test"
 	clear()
-	heading("%s · slot %d of %d · delay %d (%.0f ms)" % [config.get("mode", "lockstep"), lobby.local_slot(), players, delay, delay * 1000.0 / TICK_RATE])
+	var seat := "watching %d players" % players if lobby.local_slot() < 0 else "slot %d of %d" % [lobby.local_slot(), players]
+	heading("%s · %s · delay %d (%.0f ms)" % [config.get("mode", "lockstep"), seat, delay, delay * 1000.0 / TICK_RATE])
 	canvas = Control.new()
 	canvas.custom_minimum_size = Vector2(0, 60 * players + 20)
 	canvas.draw.connect(draw_lanes)
@@ -518,8 +546,13 @@ func on_remote_input(slot: int, tick: int, arrived: int) -> void:
 		slot_stats[slot].add(lateness)
 
 
-func on_desync(tick: int, _peer: int) -> void:
-	if not run.is_empty() and run.desync_tick < 0:
+func on_desync(tick: int, peer: int) -> void:
+	if run.is_empty():
+		return
+	# A spectator going wrong is the spectator's problem: the players carry on.
+	if lobby.is_host and roles.get(peer) == LocalNetLobby.SPECTATOR:
+		run.spectator_desyncs.append("%s at tick %d" % [lobby.members.get(peer, {}).get("name", "a spectator"), tick])
+	elif run.desync_tick < 0:
 		run.desync_tick = tick
 
 
@@ -535,6 +568,12 @@ func step_test() -> void:
 	if runner.tick < run.total:
 		runner.max_ticks_per_frame = mini(8, run.total - runner.tick)
 		runner.advance(now)
+		# How far behind the shared schedule this device shows the match.
+		if runner.tick < run.total:
+			var lag := maxi(0, int(now - runner.scheduled_usec(runner.tick)))
+			run.lag_usec += lag
+			run.lag_frames += 1
+			run.most_lag_usec = maxi(run.most_lag_usec, lag)
 		# A simulated Wi-Fi hiccup three seconds in, from this device only.
 		if options.has("hiccup") and not run.has("hiccup") and runner.tick >= 3 * TICK_RATE:
 			run.hiccup = true
@@ -569,7 +608,10 @@ func sample_input(_tick: int) -> PackedByteArray:
 	return PackedByteArray([dir + 1, 1 if touch_x >= 0 else 0])
 
 
-func simulate(_tick: int, inputs: Array[PackedByteArray]) -> void:
+func simulate(tick: int, inputs: Array[PackedByteArray]) -> void:
+	# --desync=TICK makes this device go wrong on purpose, to show what a desync looks like.
+	if options.has("desync") and tick == int(options.desync):
+		positions[0] += 1
 	for slot in inputs.size():
 		var dir: int = inputs[slot][0] - 1
 		positions[slot] = clampi(positions[slot] + dir * 37, 0, LANE_WIDTH)
@@ -653,12 +695,18 @@ func end_test(reason: String) -> void:
 	matches_played += 1
 	var lines := PackedStringArray()
 	lines.append("LOCALNET RESULT · %s" % reason)
-	lines.append("Device: %s (%s %s) · %s · slot %d of %d · match %d" % [player_name(), OS.get_name(), OS.get_version(), "host" if lobby.is_host else "guest", lobby.local_slot(), run.players, matches_played])
+	lines.append("Device: %s (%s %s) · %s · slot %d of %d · match %d" % [player_name(), OS.get_name(), OS.get_version(), "host" if lobby.is_host else ("spectator" if lobby.is_spectator() else "guest"), lobby.local_slot(), run.players, matches_played])
 	lines.append("Network: " + describe_addresses())
 	lines.append("Ran %d of %d ticks at %d Hz with input delay %d (%.1f ms) over %.1f s" % [runner.tick, run.total, TICK_RATE, sync.delay, sync.delay * 1000.0 / TICK_RATE, (now - run.began_usec) / 1_000_000.0])
 	lines.append(peer_line())
 	lines.append(stall_line())
 	lines.append("Reconnections %d" % run.reconnections)
+	if lobby.is_spectator():
+		lines.append("Spectator lag: %.1f ms behind the schedule on average, at most %.1f ms · caught up %.0f ms" % [run.lag_usec / 1000.0 / maxi(run.lag_frames, 1), run.most_lag_usec / 1000.0, runner.caught_up_usec / 1000.0])
+	if lobby.is_host and not lobby.spectators().filter(func(id): return id != lobby.local_id).is_empty():
+		lines.append("Spectators: %s · desyncs: %s · dropped: %s" % [", ".join(lobby.spectators().filter(func(id): return id != lobby.local_id).map(func(id): return lobby.members[id].name)), ", ".join(run.spectator_desyncs) if run.spectator_desyncs else "none", ", ".join(run.spectators_dropped) if run.spectators_dropped else "none"])
+	if not content_stats.is_empty():
+		lines.append("Content: " + content_line())
 	if runner.predict:
 		lines.append("Free-run: %d of %d ticks ran on a guess (%.1f%%): the share rollback would have had to correct" % [runner.predicted_ticks, runner.tick, 100.0 * runner.predicted_ticks / maxi(runner.tick, 1)])
 	else:
@@ -700,6 +748,58 @@ func save_result() -> void:
 	var file := FileAccess.open(folder.path_join("%s-%s-slot%d-match%d.txt" % [stamp, "host" if lobby.is_host else "guest", lobby.local_slot(), matches_played]), FileAccess.WRITE)
 	if file:
 		file.store_string(result_text + "\n")
+
+
+# Content: the host makes up random blobs, offers them and requires them; guests fetch them.
+
+func new_content() -> LocalNetContent:
+	var c := LocalNetContent.new(lobby)
+	c.cache_dir = "user://demo_content".path_join(player_name().validate_filename())
+	# Each run fetches afresh, so the throughput is measured.
+	DirAccess.make_dir_recursive_absolute(c.cache_dir)
+	for file in DirAccess.get_files_at(c.cache_dir):
+		DirAccess.remove_absolute(c.cache_dir.path_join(file))
+	c.max_item_bytes = maxi(c.max_item_bytes, int(float(options.get("content-item", 8)) * 1024 * 1024))
+	c.progress.connect(func(_hash, _bytes, _total):
+		if not content_stats.has("began_usec"):
+			content_stats.began_usec = Time.get_ticks_usec())
+	c.received.connect(func(item, _path):
+		content_stats.bytes = content_stats.get("bytes", 0) + item.size
+		content_stats.items = content_stats.get("items", 0) + 1)
+	c.all_present.connect(func():
+		content_stats.done_usec = Time.get_ticks_usec()
+		refresh_members())
+	c.failed.connect(func(item, reason): content_stats.failed = "%s (%s)" % [item.id, reason])
+	return c
+
+
+func offer_content(megabytes: float) -> void:
+	content = new_content()
+	var total := int(megabytes * 1024 * 1024)
+	var item_bytes := int(float(options.get("content-item", 8)) * 1024 * 1024)
+	var crypto := Crypto.new()
+	var items := []
+	var made := 0
+	while made < total:
+		var blob := crypto.generate_random_bytes(mini(item_bytes, total - made))
+		var item := LocalNetContent.describe("blob", "blob%d" % items.size(), blob)
+		content.offer(item, blob)
+		items.append(item)
+		made += blob.size()
+	content.require(items)
+	content_stats = {"offered": made}
+
+
+func content_line() -> String:
+	if content_stats.has("offered"):
+		return "offered %d items, %.1f MB" % [lobby.needed_content.size(), content_stats.offered / 1048576.0]
+	if content_stats.has("failed"):
+		return "failed: " + content_stats.failed
+	if not content_stats.has("done_usec"):
+		return "fetching (%d of %d items)" % [content_stats.get("items", 0), lobby.needed_content.size()]
+	var seconds: float = (content_stats.done_usec - content_stats.get("began_usec", content_stats.done_usec)) / 1_000_000.0
+	var megabytes: float = content_stats.get("bytes", 0) / 1048576.0
+	return "fetched %d items, %.1f MB in %.2f s (%.1f MB/s)" % [content_stats.get("items", 0), megabytes, seconds, megabytes / seconds if seconds > 0 else 0.0]
 
 
 func player_name() -> String:
