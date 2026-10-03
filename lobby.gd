@@ -18,6 +18,14 @@ extends RefCounted
 ## window ([member reconnect_window_msec]) and every guest follows it; either side can
 ## stop waiting early with [method give_up].
 ##
+## Members are players or spectators ([member max_spectators]). Spectators have no slot
+## (-1) and never hold up players: they don't count towards [member max_players], the
+## two players [method can_start] needs or [method suggested_delay], and need no ready flag.
+## A host can also stay out of the match itself ([code]host_plays[/code] in [method host]),
+## as a PC driving a big screen while phones play: its member is then a spectator too.
+## Roles are a lobby matter only; how a game keeps its spectators' state up to date is its
+## own business ([LocalNetInputSync] relays inputs to them for lockstep games).
+##
 ## Control messages are Godot variants ([method @GlobalScope.var_to_bytes], decoded without
 ## objects) over the reliable channel, so numbers and vectors keep their types. Pings are
 ## binary and unreliable. Call [method poll] every frame.
@@ -72,6 +80,11 @@ const LONGEST_FRAME_USEC := 100_000
 ## How often the host reports its own frame time while in the lobby.
 const HOST_REPORT_USEC := 1_000_000
 const START_DELAY_USEC := 1_000_000
+## LocalNet's own wire version, sent in [code]hello[/code] apart from the game's version. A
+## host turns away guests with a different one, since the two would misread each other.
+const WIRE_VERSION := 3
+const PLAYER := "player"
+const SPECTATOR := "spectator"
 
 var link := LocalNetLink.new()
 var game_id: String
@@ -79,6 +92,9 @@ var version: int
 var is_host := false
 var local_id := 0
 var max_players := 2
+## How many guests may join to watch. 0 turns spectators away. Set it before [method host]:
+## the link makes room for them then.
+var max_spectators := 0
 var session_id := ""
 var session_name := ""
 var members := {}
@@ -94,8 +110,12 @@ var reconnect_window_msec := 30_000:
 		if is_host and state != "idle":
 			_broadcast_members()
 ## When true, [method start] first sends everyone [signal preparing] and waits until
-## every member calls [method mark_loaded].
+## every member calls [method mark_loaded]. Spectators whose connection has dropped
+## aren't waited for.
 var wait_for_loading := false
+## Content the match needs, as [LocalNetContent] items: the host sets it with
+## [method LocalNetContent.require] and every member hears it with the member list.
+var needed_content := []
 
 ## Host clock minus this device's clock, from the fastest recent ping.
 var clock_offset_usec := 0
@@ -115,6 +135,8 @@ var _frame_gap_usec := 0
 var _frames := PackedInt32Array()
 var _next_host_report_usec := 0
 var _start_at := 0
+var _role := PLAYER
+var _needed_key := ""
 
 
 func _init(game: String, game_version: int) -> void:
@@ -129,10 +151,12 @@ func _init(game: String, game_version: int) -> void:
 	link.reconnect_window_msec = reconnect_window_msec
 
 
-## Opens a lobby. [param port] 0 lets the system pick a free game port.
-func host(player_name: String, players := 2, join_code := "", port := 0) -> Error:
+## Opens a lobby. [param port] 0 lets the system pick a free game port. With
+## [param host_plays] false the host takes no slot and watches as a spectator, while
+## [param players] guests play.
+func host(player_name: String, players := 2, join_code := "", port := 0, host_plays := true) -> Error:
 	# Spare peer slots let the host explain a rejection before disconnecting.
-	var err := link.host(port, players + 2)
+	var err := link.host(port, players + max_spectators + 2)
 	if err != OK:
 		return err
 	is_host = true
@@ -141,19 +165,26 @@ func host(player_name: String, players := 2, join_code := "", port := 0) -> Erro
 	session_id = "%08x%08x" % [randi(), randi()]
 	session_name = player_name
 	_join_code_hash = _hash_code(join_code)
-	members = {local_id: _member(player_name, 0)}
+	members = {local_id: _member(player_name, 0, PLAYER) if host_plays else _member(player_name, -1, SPECTATOR)}
+	needed_content = []
+	_needed_key = ""
 	members[local_id].synced = true
 	state = "lobby"
 	members_changed.emit()
 	return OK
 
 
-func join(address: String, port: int, player_name: String, join_code := "") -> Error:
+## Joins the host at [param address]. [param role] is "player", or "spectator" to watch
+## (the host must allow it with [member max_spectators]).
+func join(address: String, port: int, player_name: String, join_code := "", role := PLAYER) -> Error:
 	var err := link.join(address, port)
 	if err != OK:
 		return err
 	is_host = false
 	_name = player_name
+	_role = SPECTATOR if role == SPECTATOR else PLAYER
+	needed_content = []
+	_needed_key = ""
 	_join_code_hash = _hash_code(join_code)
 	_samples.clear()
 	_round_trips.clear()
@@ -190,7 +221,23 @@ func poll() -> void:
 
 ## What discovery should tell scanners about this session.
 func advert() -> Dictionary:
-	return {"id": session_id, "name": session_name, "port": link.port, "players": members.size(), "max": max_players, "state": state, "code": _join_code_hash != ""}
+	return {"id": session_id, "name": session_name, "port": link.port, "players": players().size(), "max": max_players, "spectators": _watching_guests(), "max_spectators": max_spectators, "state": state, "code": _join_code_hash != ""}
+
+
+## Member ids of the players, in join order.
+func players() -> Array:
+	return _ids_with_role(PLAYER)
+
+
+## Member ids of the spectators, in join order, including a host that doesn't play.
+func spectators() -> Array:
+	return _ids_with_role(SPECTATOR)
+
+
+## True when member [param id] (this device by default) watches rather than plays.
+func is_spectator(id := -1) -> bool:
+	var member: Dictionary = members.get(local_id if id == -1 else id, {})
+	return member.get("role", PLAYER) == SPECTATOR
 
 
 func set_ready(ready: bool) -> void:
@@ -208,25 +255,37 @@ func set_config(values: Dictionary) -> void:
 		_broadcast_members()
 
 
-func can_start(require_ready := false) -> bool:
-	if not is_host or state != "lobby" or members.size() < 2:
+## Host only: whether [method start] can go ahead: two players or more, every player
+## connected and synced (with [param require_ready], ready too; with [param require_content],
+## holding all the [member needed_content]). Spectators only need a synced clock, so they
+## can follow the start.
+func can_start(require_ready := false, require_content := false) -> bool:
+	if not is_host or state != "lobby" or players().size() < 2:
 		return false
 	for member in members.values():
-		if not member.synced or not member.connected or (require_ready and not member.ready):
+		if not member.synced:
 			return false
+		if member.get("role", PLAYER) == SPECTATOR:
+			continue
+		if not member.connected or (require_ready and not member.ready):
+			return false
+		if require_content and not needed_content.is_empty():
+			var content: Dictionary = member.get("content", {})
+			if content.get("need") != _needed_key or content.get("missing", 1) != 0:
+				return false
 	return true
 
 
-## Host only: numbers the slots in join order, then starts everyone at the same moment
-## (after everyone has loaded, with [member wait_for_loading]).
+## Host only: numbers the players' slots in join order, then starts everyone at the same
+## moment (after everyone has loaded, with [member wait_for_loading]).
 func start() -> void:
 	if not is_host or state != "lobby":
 		return
-	var ids := members.keys()
-	ids.sort()
+	var ids := players()
 	for i in ids.size():
 		members[ids[i]].slot = i
-		members[ids[i]].loaded = false
+	for id in members:
+		members[id].loaded = false
 	if not wait_for_loading:
 		_go()
 		return
@@ -274,6 +333,7 @@ func local_slot() -> int:
 
 
 ## Which slot each link peer sends. Clients only hear from the host, which relays.
+## Spectators send none (-1).
 func peer_slots() -> Dictionary:
 	if not is_host:
 		return {LocalNetLink.HOST_ID: -1}
@@ -289,27 +349,42 @@ func host_to_local_usec(host_usec: int) -> int:
 
 
 ## An input delay in ticks long enough for an input to reach the other device before
-## it's due there, from what the members have reported: half the slowest member's typical
+## it's due there, from what the players have reported: half the slowest player's typical
 ## (75th-percentile) round trip, plus three quarters of the two slowest frame times, plus
 ## [param margin_msec]. An input can be sampled up to a frame late, since devices only
 ## sample on frames, and noticed up to a frame late at the other end; half the round trip
 ## already includes the average quarter of each. Host and guests work it out from the same
 ## member list, so they agree. On a phone hotspot this comes to 4 or 5 ticks at 120 Hz.
+## Spectators' round trips and frames are left out.
+##
+## When the host doesn't play, every input crosses two links (guest, host, guest), so the
+## round trip part becomes half of each of the two slowest players' round trips, plus the
+## host's whole frame, since it relays once a frame.
 func suggested_delay(tick_rate := 120, margin_msec := 3.0, min_ticks := 2, max_ticks := 12) -> int:
-	var round_trip := 0
+	var round_trips := []
 	var frames := []
-	for member in members.values():
-		var net: Dictionary = member.get("net", {})
-		round_trip = maxi(round_trip, net.get("rtt_p75_usec", net.get("rtt_p90_usec", 0)))
+	for id in players():
+		var net: Dictionary = members[id].get("net", {})
+		var round_trip: int = net.get("rtt_p75_usec", net.get("rtt_p90_usec", 0))
+		if id == local_id and not is_host:
+			round_trip = maxi(round_trip, _round_trip_percentile(75))
+		round_trips.append(round_trip)
 		frames.append(net.get("frame_usec", 0))
-	if not is_host:
-		round_trip = maxi(round_trip, _round_trip_percentile(75))
+	if not is_host and not members.has(local_id):
+		round_trips.append(_round_trip_percentile(75))
+	round_trips.sort()
+	round_trips.reverse()
 	# A member that hasn't reported yet counts as a 60 fps device.
 	frames = frames.map(func(f): return f if f > 0 else 16_667)
 	frames.sort()
 	frames.reverse()
 	var slowest_two: int = frames[0] + (frames[1] if frames.size() > 1 else frames[0]) if not frames.is_empty() else 33_333
-	var msec := round_trip / 2000.0 + slowest_two * 0.75 / 1000.0 + margin_msec
+	var path_usec: float = round_trips[0] / 2.0 if not round_trips.is_empty() else 0.0
+	if is_spectator(LocalNetLink.HOST_ID):
+		var host_frame: int = members[LocalNetLink.HOST_ID].get("net", {}).get("frame_usec", 0)
+		path_usec = (round_trips[0] + (round_trips[1] if round_trips.size() > 1 else 0)) / 2.0 if not round_trips.is_empty() else 0.0
+		path_usec += host_frame if host_frame > 0 else 16_667
+	var msec := path_usec / 1000.0 + slowest_two * 0.75 / 1000.0 + margin_msec
 	return clampi(ceili(msec * tick_rate / 1000.0), min_ticks, max_ticks)
 
 
@@ -333,8 +408,22 @@ func _time_frame() -> void:
 	_last_poll_usec = now
 
 
-func _member(player_name: String, slot: int) -> Dictionary:
-	return {"name": player_name, "slot": slot, "ready": false, "synced": false, "loaded": false, "connected": true, "data": {}, "net": {}}
+func _member(player_name: String, slot: int, role := PLAYER) -> Dictionary:
+	return {"name": player_name, "slot": slot, "role": role, "ready": false, "synced": false, "loaded": false, "connected": true, "data": {}, "net": {}}
+
+
+func _ids_with_role(role: String) -> Array:
+	var ids := []
+	for id in members:
+		if members[id].get("role", PLAYER) == role:
+			ids.append(id)
+	ids.sort()
+	return ids
+
+
+# Spectating guests: the ones [member max_spectators] limits.
+func _watching_guests() -> int:
+	return spectators().filter(func(id): return id != local_id or not is_host).size()
 
 
 func _update_self(values: Dictionary) -> void:
@@ -361,7 +450,7 @@ func _start_when_loaded() -> void:
 	if state != "preparing":
 		return
 	for member in members.values():
-		if not member.loaded:
+		if not member.loaded and (member.connected or member.get("role", PLAYER) == PLAYER):
 			_broadcast_members()
 			return
 	_go()
@@ -369,7 +458,7 @@ func _start_when_loaded() -> void:
 
 func _on_peer_connected(id: int) -> void:
 	if not is_host:
-		_send(id, {"t": "hello", "game": game_id, "v": version, "name": _name, "code": _join_code_hash})
+		_send(id, {"t": "hello", "game": game_id, "v": version, "ln": WIRE_VERSION, "role": _role, "name": _name, "code": _join_code_hash})
 		link.flush()
 
 
@@ -447,26 +536,34 @@ func _host_message(id: int, message: Dictionary) -> void:
 				_broadcast_members()
 				return
 			var reason := ""
+			var watching: bool = message.get("role", PLAYER) == SPECTATOR
 			if message.get("game") != game_id:
 				reason = "Different game"
 			elif message.get("v") != version:
 				reason = "Different version (host has v%d)" % version
+			elif message.get("ln") != WIRE_VERSION:
+				reason = "Different LocalNet version"
 			elif _join_code_hash != "" and message.get("code") != _join_code_hash:
 				reason = "Wrong join code"
 			elif state != "lobby":
 				reason = "Already playing"
-			elif members.size() >= max_players:
+			elif watching and max_spectators <= 0:
+				reason = "Spectators aren't allowed"
+			elif watching and _watching_guests() >= max_spectators:
+				reason = "No room for spectators"
+			elif not watching and players().size() >= max_players:
 				reason = "Lobby is full"
 			if reason != "":
 				_send(id, {"t": "reject", "reason": reason})
 				link.kick(id)
 				return
-			members[id] = _member(str(message.get("name", "Player")).left(24), _free_slot())
+			var player_name := str(message.get("name", "Player")).left(24)
+			members[id] = _member(player_name, -1, SPECTATOR) if watching else _member(player_name, _free_slot())
 			_send(id, {"t": "welcome", "id": id, "reconnect_window_msec": reconnect_window_msec})
 			_broadcast_members()
 		"member":
 			if members.has(id):
-				for key in ["ready", "synced", "loaded", "data", "net"]:
+				for key in ["ready", "synced", "loaded", "data", "net", "content"]:
 					if message.has(key):
 						members[id][key] = message[key]
 				_broadcast_members()
@@ -490,6 +587,9 @@ func _client_message(message: Dictionary) -> void:
 			members = message.members
 			config = message.config
 			session_name = message.name
+			var needed: Dictionary = message.get("content", {})
+			needed_content = needed.get("items", [])
+			_needed_key = str(needed.get("key", ""))
 			reconnect_window_msec = message.get("reconnect_window_msec", reconnect_window_msec)
 			for id in members:
 				if id != local_id and before.has(id) and before[id].get("connected", true) != members[id].get("connected", true):
@@ -559,7 +659,7 @@ func _round_trip_percentile(p: float) -> int:
 
 
 func _free_slot() -> int:
-	var used := members.values().map(func(m): return m.slot)
+	var used := members.values().filter(func(m): return m.get("role", PLAYER) == PLAYER).map(func(m): return m.slot)
 	var slot := 0
 	while used.has(slot):
 		slot += 1
@@ -569,8 +669,28 @@ func _free_slot() -> int:
 func _broadcast_members() -> void:
 	members_changed.emit()
 	if is_host:
-		_send_all({"t": "lobby", "members": members, "config": config, "name": session_name, "reconnect_window_msec": reconnect_window_msec})
+		var message := {"t": "lobby", "members": members, "config": config, "name": session_name, "reconnect_window_msec": reconnect_window_msec}
+		if _needed_key != "":
+			message.content = {"items": needed_content, "key": _needed_key}
+		_send_all(message)
 		link.flush()
+
+
+# For [LocalNetContent]: the host sets what the match needs, and shares it.
+func _set_needed_content(items: Array, key: String) -> void:
+	if is_host:
+		needed_content = items.duplicate(true)
+		_needed_key = key
+		_broadcast_members()
+
+
+# For [LocalNetContent]: this device reports how much of [member needed_content] it holds.
+func _report_content(report: Dictionary) -> void:
+	_update_self({"content": report})
+
+
+func _needed_content_key() -> String:
+	return _needed_key
 
 
 func _send(id: int, message: Dictionary) -> void:

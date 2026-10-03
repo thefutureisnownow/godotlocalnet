@@ -22,6 +22,14 @@ extends RefCounted
 ## time in flight cancels out ([method LocalNetInputSync.clock_lead]). A device more than
 ## [member sync_threshold] ticks ahead of any peer eases back, using at most
 ## [member sync_rate] of the elapsed time.
+##
+## A device with no slot ([member LocalNetInputSync.local_slot] -1) samples nothing. A
+## spectating guest hears every input second-hand, through the host, so it runs
+## [member spectator_lag_ticks] behind the shared schedule to ride out the extra hop's
+## jitter. Nobody eases for it, and it never eases anyone: after a stall it eases back in
+## like everyone else, then catches up by running up to [member catch_up_rate] faster until
+## it's back on the schedule, or as close as the inputs it holds allow. A host that doesn't play hears every input first-hand and
+## runs on the schedule like a player.
 
 signal waiting(slots: Array[int])
 signal resumed(stalled_usec: int)
@@ -42,6 +50,10 @@ var sync_threshold := 0.5
 var sync_rate := 0.1
 ## Fresh packets needed from every peer before acting again, so one correction settles first.
 var sync_samples := 5
+## How far behind the shared schedule a spectating guest runs.
+var spectator_lag_ticks := 4
+## How much faster than the schedule a spectating guest may run while it catches up.
+var catch_up_rate := 0.25
 
 var sample_input: Callable
 var step: Callable
@@ -56,10 +68,13 @@ var predicted_ticks := 0
 var shifted_usec := 0
 ## How much time sync slowed this device down in total.
 var eased_usec := 0
+## How much a spectating guest has caught up on the schedule in total.
+var caught_up_usec := 0
 
 var _stall_since := 0
 var _last_advance_usec := -1
 var _ease_owed := 0
+var _catch_up_owed := 0
 
 
 ## [param sample] is (tick) -> PackedByteArray, [param simulate] is
@@ -76,11 +91,12 @@ func _init(input_sync: LocalNetInputSync, start_usec: int, ticks_per_second: int
 ## Runs every tick due by [param now]; returns how many ran.
 func advance(now := Time.get_ticks_usec()) -> int:
 	frames += 1
-	var due := due_tick(now)
+	var lag := spectator_lag_ticks if sync.is_spectating() else 0
+	var due := due_tick(now) - lag
 	var ran := 0
 	var stalled := false
 	while tick <= due and ran < max_ticks_per_frame:
-		while sync.next_local_tick() <= tick + sync.delay:
+		while sync.local_slot != -1 and sync.next_local_tick() <= tick + sync.delay:
 			sync.add_local_input(sync.next_local_tick(), sample_input.call(sync.next_local_tick()))
 		var inputs: Array[PackedByteArray]
 		if sync.is_ready(tick):
@@ -104,7 +120,7 @@ func advance(now := Time.get_ticks_usec()) -> int:
 	sync.flush()
 	# A frame that stepped some ticks before running out is slow, not frozen.
 	_track_stall(stalled and ran == 0, now)
-	var behind := due_tick(now) - tick
+	var behind := due_tick(now) - lag - tick
 	if behind > slack_ticks:
 		var shift := ceili((behind - slack_ticks) * tick_usec)
 		schedule_usec += shift
@@ -123,10 +139,10 @@ func due_tick(now := Time.get_ticks_usec()) -> int:
 
 ## How many ticks ahead of the slowest peer this device's schedule runs. Negative means
 ## behind. Until a peer has sent its own reading, half the round trip stands in for the
-## time in flight.
+## time in flight. Only [method LocalNetInputSync.timing_peers] count: spectators don't.
 func advantage() -> float:
 	var worst := -INF
-	for id in sync.peers():
+	for id in sync.timing_peers():
 		if sync.advantage_samples(id) > 0:
 			var lead := sync.clock_lead(id)
 			if is_nan(lead):
@@ -144,7 +160,8 @@ func is_waiting() -> bool:
 	return _stall_since != 0
 
 
-## Slots whose input for the current tick hasn't arrived.
+## Slots whose input for the current tick hasn't arrived. Spectators have no slot, so
+## they never appear here.
 func waiting_on() -> Array[int]:
 	var slots: Array[int] = []
 	for slot in sync.slot_count:
@@ -154,7 +171,8 @@ func waiting_on() -> Array[int]:
 
 
 # Decides how far to ease back once every peer has sent fresh readings, then pays it
-# off a little each frame so the game only ever runs slightly slow.
+# off a little each frame so the game only ever runs slightly slow. A spectating guest
+# that has fallen behind pays off its catching up the same way, running slightly fast.
 func _sync_time(now: int) -> void:
 	var frame := now - _last_advance_usec if _last_advance_usec >= 0 else 0
 	_last_advance_usec = now
@@ -168,12 +186,28 @@ func _sync_time(now: int) -> void:
 		# Readings taken while easing are out of date.
 		sync.clear_advantage()
 		return
-	for id in sync.peers():
+	if _catch_up_owed > 0:
+		var hurry := mini(_catch_up_owed, int(frame * catch_up_rate))
+		schedule_usec -= hurry
+		caught_up_usec += hurry
+		_catch_up_owed -= hurry
+		if _catch_up_owed <= 0:
+			sync.clear_advantage()
+		return
+	for id in sync.timing_peers():
 		if sync.advantage_samples(id) < sync_samples:
 			return
 	var ahead := advantage()
 	if ahead > sync_threshold:
 		_ease_owed = ceili(ahead * tick_usec)
+	elif ahead < -sync_threshold and sync.is_spectating():
+		# Only as far as the inputs it holds allow: catching up into a wait helps nobody.
+		var held := sync.latest(0)
+		for slot in sync.slot_count:
+			held = mini(held, sync.latest(slot))
+		var behind := minf(-ahead, held - (due_tick(now) - spectator_lag_ticks) - 1)
+		if behind > sync_threshold:
+			_catch_up_owed = ceili(behind * tick_usec)
 	sync.clear_advantage()
 
 
