@@ -674,6 +674,10 @@ func _client_message(message: Dictionary) -> void:
 				_begin(message.start_at)
 			elif message.state == "preparing" and state != "preparing":
 				_prepare()
+			elif message.state == "preparing" and _loaded:
+				# Loaded while the link was down: that message was lost, so say it again.
+				_send(LocalNetLink.HOST_ID, {"t": "member", "loaded": true})
+				link.flush()
 			elif message.state == "lobby" and state in ["preparing", "started"]:
 				_return()
 		"prepare":

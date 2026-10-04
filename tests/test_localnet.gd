@@ -69,6 +69,7 @@ func run() -> void:
 	content_rehash()
 	content_items()
 	spectator_drops_loading()
+	loaded_while_dropped()
 	spectator_content_loading()
 	game_channels()
 	spectator_told_dropped()
@@ -1858,6 +1859,26 @@ func spectator_drops_loading() -> void:
 	pump([host, guest, watcher], 0.5)
 	check(not host.can_start(), "A player whose connection drops is still waited for")
 	for l in [host, guest, watcher]:
+		l.leave()
+
+
+# A player that calls mark_loaded() while its connection is down tells the host again once
+# it's back, so the start doesn't wait on a "loaded" that never arrived.
+func loaded_while_dropped() -> void:
+	var host := host_lobby()
+	host.wait_for_loading = true
+	var guest := join_lobby(host, "Guest")
+	pump([host, guest], 6.0, func(): return host.can_start())
+	host.start()
+	host.mark_loaded()
+	pump([host, guest], 2.0, func(): return guest.state == "preparing")
+	guest.link.debug_drop_connection(LocalNetLink.HOST_ID, 800)
+	guest.mark_loaded()
+	pump([host, guest], 0.3)
+	check(host.state == "preparing" and not host.members[guest.local_id].loaded, "A player's loaded message sent while its connection is down doesn't arrive")
+	pump([host, guest], 6.0, func(): return host.state == "started" and guest.state == "started")
+	check(host.state == "started" and guest.state == "started", "...but it's sent again on resume, and the match starts")
+	for l in [host, guest]:
 		l.leave()
 
 
