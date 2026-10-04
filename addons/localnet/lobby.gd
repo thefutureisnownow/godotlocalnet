@@ -83,9 +83,15 @@ const LONGEST_FRAME_USEC := 100_000
 ## How often the host reports its own frame time while in the lobby.
 const HOST_REPORT_USEC := 1_000_000
 const START_DELAY_USEC := 1_000_000
-## LocalNet's own wire version, sent in [code]hello[/code] apart from the game's version. A
-## host turns away guests with a different one, since the two would misread each other.
+## LocalNet's own wire version, sent in [code]hello[/code] apart from the game's version,
+## along with the oldest version this one still works with ([constant WIRE_VERSION_MIN]).
+## A host lets a guest in when their ranges overlap, and turns it away otherwise, since the
+## two would misread each other. Additive changes, which an older peer can do without,
+## raise [constant WIRE_VERSION] only; breaking ones raise [constant WIRE_VERSION_MIN] too.
+## Each member's version is kept under its member's [code]"ln"[/code] key, so a feature
+## added later can check who has it.
 const WIRE_VERSION := 3
+const WIRE_VERSION_MIN := 3
 const PLAYER := "player"
 const SPECTATOR := "spectator"
 
@@ -430,7 +436,7 @@ func _time_frame() -> void:
 
 
 func _member(player_name: String, slot: int, role := PLAYER) -> Dictionary:
-	return {"name": player_name, "slot": slot, "role": role, "ready": false, "synced": false, "loaded": false, "connected": true, "data": {}, "net": {}}
+	return {"name": player_name, "slot": slot, "role": role, "ln": WIRE_VERSION, "ready": false, "synced": false, "loaded": false, "connected": true, "data": {}, "net": {}}
 
 
 func _ids_with_role(role: String) -> Array:
@@ -479,7 +485,7 @@ func _start_when_loaded() -> void:
 
 func _on_peer_connected(id: int) -> void:
 	if not is_host:
-		_send(id, {"t": "hello", "game": game_id, "v": version, "ln": WIRE_VERSION, "role": _role, "name": _name, "code": _join_code_hash})
+		_send(id, {"t": "hello", "game": game_id, "v": version, "ln": WIRE_VERSION, "ln_min": WIRE_VERSION_MIN, "role": _role, "name": _name, "code": _join_code_hash})
 		link.flush()
 
 
@@ -568,7 +574,7 @@ func _host_message(id: int, message: Dictionary) -> void:
 				reason = "Different game"
 			elif message.get("v") != version:
 				reason = "Different version (host has v%d)" % version
-			elif message.get("ln") != WIRE_VERSION:
+			elif not _wire_compatible(message):
 				reason = "Different LocalNet version"
 			elif _join_code_hash != "" and message.get("code") != _join_code_hash:
 				reason = "Wrong join code"
@@ -586,6 +592,7 @@ func _host_message(id: int, message: Dictionary) -> void:
 				return
 			var player_name := str(message.get("name", "Player")).left(24)
 			members[id] = _member(player_name, -1, SPECTATOR) if watching else _member(player_name, _free_slot())
+			members[id].ln = message.ln
 			_send(id, {"t": "welcome", "id": id, "reconnect_window_msec": reconnect_window_msec})
 			_broadcast_members()
 		"member":
@@ -729,6 +736,15 @@ func _send_all(message: Dictionary) -> void:
 	for id in members:
 		if id != local_id:
 			link.send(id, LocalNetLink.CHANNEL_CONTROL, bytes, true)
+
+
+# Whether a guest's LocalNet works with this one: their ranges of versions overlap. A hello
+# without "ln" comes from LocalNet 0.2; one without "ln_min" is taken to work only with
+# its own version.
+static func _wire_compatible(hello: Dictionary) -> bool:
+	var newest = hello.get("ln")
+	var oldest = hello.get("ln_min", newest)
+	return newest is int and oldest is int and newest >= WIRE_VERSION_MIN and WIRE_VERSION >= oldest
 
 
 static func _hash_code(code: String) -> String:

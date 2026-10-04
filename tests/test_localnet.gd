@@ -72,6 +72,7 @@ func run() -> void:
 	spectator_content_loading()
 	game_channels()
 	spectator_told_dropped()
+	wire_range()
 	print("LOCALNET: %d checks, %d failures" % [checks, failures.size()])
 	for failure in failures:
 		print("  FAIL ", failure)
@@ -1995,3 +1996,55 @@ func spectator_told_dropped() -> void:
 	check(told == ["watcher"], "The spectator's own input sync says it was dropped, once, and a player's ignores it: %s" % [told])
 	for s in [host, guest, watcher]:
 		s.close()
+
+
+# Sends [param hello] to [param host] over a bare link; returns "welcome" or the reason
+# it was turned away, and the link (still open after a welcome).
+func say_hello(host: LocalNetLobby, hello: Dictionary) -> Array:
+	var bare := LocalNetLink.new()
+	bare.join("127.0.0.1", host.link.port)
+	var answer := [""]
+	bare.peer_connected.connect(func(id):
+		bare.send(id, LocalNetLink.CHANNEL_CONTROL, var_to_bytes(hello), true)
+		bare.flush())
+	bare.received.connect(func(_id, _channel, bytes):
+		var message = bytes_to_var(bytes)
+		if message is Dictionary and message.get("t") == "reject":
+			answer[0] = message.reason
+		elif message is Dictionary and message.get("t") == "welcome":
+			answer[0] = "welcome")
+	pump([host, bare], 3.0, func(): return answer[0] != "")
+	return [answer[0], bare]
+
+
+# Peers connect when their ranges of LocalNet versions overlap.
+func wire_range() -> void:
+	check(LocalNetLobby.WIRE_VERSION == 3 and LocalNetLobby.WIRE_VERSION_MIN == 3, "LocalNet 0.3 speaks wire version 3, back to 3")
+	var host := host_lobby(4)
+	var hello := {"t": "hello", "game": GAME, "v": 1, "name": "Next"}
+	var cases := [
+		[{"ln": 4, "ln_min": 3}, "welcome", "a newer guest that still works with 3"],
+		[{"ln": 5, "ln_min": 4}, "Different LocalNet version", "a newer guest that no longer works with 3"],
+		[{"ln": 2, "ln_min": 2}, "Different LocalNet version", "an older guest"],
+		[{"ln": 4}, "Different LocalNet version", "a newer guest that doesn't say how far back it goes"],
+		[{"ln": "3", "ln_min": 3}, "Different LocalNet version", "a version that isn't a number"],
+	]
+	var open := []
+	for case in cases:
+		var message := hello.duplicate()
+		message.merge(case[0])
+		var answer := say_hello(host, message)
+		check(answer[0] == case[1], "The host answers %s: %s" % [case[2], answer[0]])
+		if answer[0] == "welcome":
+			open.append(answer[1])
+		else:
+			answer[1].close()
+	var newer: Array = host.members.values().filter(func(m): return m.name == "Next")
+	check(newer.size() == 1 and newer[0].ln == 4, "A member's LocalNet version is kept in its member dictionary")
+	var guest := join_lobby(host, "Guest")
+	pump([host, guest] + open, 3.0, func(): return guest.members.size() == 3)
+	check(host.members.get(guest.local_id, {}).get("ln") == 3 and guest.members.get(1, {}).get("ln") == 3, "Every member has one, the host included, and everyone sees them")
+	for link in open:
+		link.close()
+	guest.leave()
+	host.leave()

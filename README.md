@@ -17,7 +17,9 @@ git subtree pull --prefix=addons/localnet https://github.com/stained/godotlocaln
 
 Change LocalNet here, never in a game's copy. After the tests pass, bump `addons/localnet/VERSION`, commit, and run `tools/publish_addon.sh` to update the `addon` branch.
 
-**Updating a game to 0.3:** bump the game's own protocol version (the `version` it gives `LocalNetDiscovery` and `LocalNetLobby`, such as Snoek'em's `PROTOCOL`), even if no game code changes. 0.3 adds three ENet channels (content, and two for the game's own use), and its lobby `hello` carries LocalNet's own wire version (`"ln": 3`). A 0.3 host turns away a guest without it, or with another one, as "Different LocalNet version", but a 0.2 host ignores it and would let a 0.3 guest in. Bumping the game's version keeps old and new builds apart on both sides, and discovery lists the other build as incompatible.
+**Updating a game to 0.3:** bump the game's own protocol version (the `version` it gives `LocalNetDiscovery` and `LocalNetLobby`, such as Snoek'em's `PROTOCOL`), even if no game code changes. 0.3 adds three ENet channels (content, and two for the game's own use), and its lobby `hello` carries LocalNet's own wire version (`"ln": 3`) and the oldest one it still works with (`"ln_min": 3`). A 0.3 host turns away a guest without them (a 0.2 build), or one whose range doesn't overlap its own, as "Different LocalNet version", but a 0.2 host ignores them and would let a 0.3 guest in. Bumping the game's version keeps old and new builds apart on both sides, and discovery lists the other build as incompatible.
+
+**LocalNet's wire version** (`LocalNetLobby.WIRE_VERSION` and `WIRE_VERSION_MIN`) is kept apart from the game's. A host lets a guest in when their ranges overlap: the guest's `ln` is at least the host's `ln_min`, and the host's `ln` at least the guest's `ln_min`. A change that older peers can do without, such as a new message they'd ignore, raises `ln` only, so old and new builds still meet. A change that breaks older peers raises `ln_min` too. Each member's `ln` is kept in its member dictionary (`members[id].ln`), so a feature added later can check which members have it.
 
 ## The addon
 
@@ -86,10 +88,10 @@ Lobby messages travel on ENet channel 0 (reliable) as Godot variants: `var_to_by
 
 | Message | Direction |
 |---|---|
-| `hello` | guest → host: game, version, `"ln"` (LocalNet's wire version, 3), `"role"` (`"player"` or `"spectator"`), name, code |
+| `hello` | guest → host: game, version, `"ln"` and `"ln_min"` (LocalNet's wire version, 3, and the oldest it works with, 3), `"role"` (`"player"` or `"spectator"`), name, code |
 | `welcome` / `reject` | host → guest |
 | `member` | guest → host: ready, synced, loaded, data, net, `"content"` (`{"need", "missing"}`) |
-| `lobby`, `prepare`, `start`, `return` | host → everyone. `lobby` carries the members (each with a `"role"`), and `"content"` once the host has required some. |
+| `lobby`, `prepare`, `start`, `return` | host → everyone. `lobby` carries the members (each with a `"role"` and its `"ln"`), and `"content"` once the host has required some. |
 
 Match traffic is binary and little-endian. The first byte of every packet is a kind code, so several listeners can share a channel.
 
@@ -355,7 +357,7 @@ godot --headless --path . --script tests/test_demo.gd       # 41 checks, about 2
   - a spectator following a lockstep match;
   - a slow spectator (20 fps, 120 ms away) never stalling the players or easing their schedules, and a late one catching up;
   - a spectator that stops confirming being dropped once `keep_ticks` behind, and told so, again if it was away and reconnects;
-  - a guest of another LocalNet version turned away.
+  - a guest of another LocalNet version turned away, and one whose range of versions overlaps let in, with its version kept in its member dictionary.
 - **Content:**
   - offer and require, `can_start(false, true)`, and cached content not fetched again;
   - an item only a guest has, passed on through the host;
