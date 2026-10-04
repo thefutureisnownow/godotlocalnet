@@ -98,7 +98,10 @@ WANT   ch3 reliable  [14][hash: 32 bytes][offset: u32]         37 bytes
 CHUNK  ch3 reliable  [15][hash: 32 bytes][offset: u32][bytes]  up to 37 + 16,384 bytes
 ACK    ch3 reliable  [16][hash: 32 bytes][offset: u32]         37 bytes
 NOPE   ch3 reliable  [17][hash: 32 bytes][reason: u8]          34 bytes   1: don't have it, 2: nobody has it, 3: can't read it
+CANCEL ch3 reliable  [18][hash: 32 bytes]                      33 bytes   don't send it any more
 ```
+
+Every chunk from the device a fetch asked is acknowledged, whether it's kept or not, so the sender always knows what's still in flight. A sender closes a transfer when it hears CANCEL or NOPE for that item, and when the chunks it has in flight go unacknowledged for 5 s.
 
 ## Dropped connections
 
@@ -196,6 +199,8 @@ content.received.connect(func(item, path): install(item, path))
 # Every frame, after lobby.poll(): content.poll(). The host starts once lobby.can_start(false, true).
 ```
 
+`describe()` hashes the whole item before it returns, at about 400 MB/s on a laptop and a few times slower on a phone: a 32 MB item takes about 80 ms on a laptop and a few hundred on a phone. A game describes its own content once, when it's made or installed, and can keep the item with it. For big items, call `describe()` from a thread (`WorkerThreadPool.add_task()`): it touches nothing shared. That keeps one simple call rather than adding a second, poll-driven way to describe items.
+
 Items are matched by their sha256, never their id: a different version under the same id counts as missing, since devices running different content would drift apart. Every member hears what's required with the member list, fetches what it lacks and reports how many items are still missing under its member's `"content"` key, and `can_start(require_ready, require_content)` can wait for that. Guests fetch from the host. When only a guest has an item, the host fetches it from that guest, keeps it and passes it on, so content travels in a star like everything else.
 
 | Setting, call or signal | Effect |
@@ -205,9 +210,10 @@ Items are matched by their sha256, never their id: a different version under the
 | `cache_dir` | `user://localnet_content/` by default. Downloads are `<hash>`, partial ones `<hash>.part`. |
 | `max_item_bytes` | 32 MB by default; bigger items are never asked for. Raise it for large mods. |
 | `budget_bytes` | Bytes of chunks sent per frame, 128 KB by default. |
-| `progress(hash, bytes, total)`, `received(item, path)`, `failed(item, reason)`, `all_present` | Reasons for failing are "Nobody has it", "Too big", "Didn't match its hash" and "Couldn't be read". |
+| `hash_budget_bytes` | Bytes of a partial download hashed per frame when it resumes, 1 MB by default (about 2 ms on a laptop). |
+| `progress(hash, bytes, total)`, `received(item, path)`, `failed(item, reason)`, `all_present` | Reasons for failing are "Nobody has it", "Too big", "Didn't match its hash" and "Couldn't be read". Each is reported once per item. On the host, "Nobody has it" and "Didn't match its hash" mean nobody is left to ask for now; it keeps trying, and asks members who join later. |
 
-Transfers have their own reliable channel. ENet's reliable window (64 KB) is shared by all of a peer's channels, so a big backlog of chunks would hold up lobby messages and checksums behind it. Each peer therefore gets at most 4 unacknowledged 16 KB chunks, and the sender keeps to `budget_bytes` a frame. Transfers only run in the lobby: they pause when a match is preparing or playing and carry on when everyone returns. A partial download carries on from its `.part` file after a dropped connection, a rematch or a restart of the app. A finished one is checked against its hash before it's renamed into place; one that doesn't match is thrown away. A device only accepts chunks of items it asked for, from the device it asked, and only serves items it offered (the host also serves required items it has fetched).
+Transfers have their own reliable channel. ENet's reliable window (64 KB) is shared by all of a peer's channels, so a big backlog of chunks would hold up lobby messages and checksums behind it. Each peer therefore gets at most 4 unacknowledged 16 KB chunks, and the sender keeps to `budget_bytes` a frame. When the host changes what's needed mid-transfer, the fetch that's no longer wanted is called off (CANCEL), so the sender's window frees up at once for the next item; chunks of it still arriving are answered with another cancel. A transfer that goes quiet for 5 s (`STALL_USEC`) while it should be moving is let go by the sender, and asked for again by the fetcher (the host asks the next member), so nothing lost along the way can hold up a peer for good. A lobby that leaves and opens a new session starts its transfers afresh. Transfers only run in the lobby: they pause when a match is preparing or playing and carry on when everyone returns. A partial download carries on from its `.part` file after a dropped connection, a rematch or a restart of the app. A finished one is checked against its hash before it's renamed into place; one that doesn't match is thrown away. A guest then gives up on the item. The host, which passes content on, asks the next member instead, never asks the member whose copy was bad again, and only reports `failed` once nobody is left to ask, so one bad copy can't stop it serving everyone else. Resuming from a `.part` file hashes what's already there a little each frame (`hash_budget_bytes`), so a big partial download doesn't hold up a frame. A device only accepts chunks of items it asked for, from the device it asked, and only serves items it offered (the host also serves required items it has fetched).
 
 **Never load downloaded content through `ResourceLoader`** (`load()`, `ResourceLoader.load()` or a scene that references it). `.tres`, `.res` and `.tscn` files can embed scripts, which would run with the game's permissions. Read downloads as data: `GLTFDocument` for models, `Image.load_from_buffer()` for images, `JSON` for settings, and `ZIPReader` to unpack.
 
@@ -331,10 +337,14 @@ godot --headless --path . --script tests/test_demo.gd       # 41 checks, about 2
 - **Content:**
   - offer and require, `can_start(false, true)`, and cached content not fetched again;
   - an item only a guest has, passed on through the host;
-  - bytes that don't match their hash thrown away;
-  - a transfer carrying on after a dropped connection, pausing for a match, and resuming from its partial file in a new session;
+  - bytes that don't match their hash thrown away, and a host given a bad copy asking the next member, then members who join later;
+  - hashes that must be exactly 64 lowercase hex digits, and `describe()` on a worker thread;
+  - a transfer carrying on after a dropped connection, pausing for a match, and resuming from its partial file in a new session, hashed a little each frame;
   - the size limit, chunks nobody asked for, and items nobody offered;
-  - a 16 MB transfer with at most 4 chunks in flight, while lobby messages and checksums arrive at once.
+  - a 16 MB transfer with at most 4 chunks in flight, while lobby messages and checksums arrive at once;
+  - the host changing what's needed mid-transfer, in both directions, with the old transfer called off and the window kept;
+  - repeated WANTs, WANTs past the end, and transfers that go quiet at either end;
+  - a new session starting with no transfers left from the last.
 - **Other:** desync detection, players leaving, and the statistics maths.
 
 `test_demo.gd` launches the link test app as separate host and guest processes and reads the results they save:

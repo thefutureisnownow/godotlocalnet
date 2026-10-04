@@ -62,6 +62,12 @@ func run() -> void:
 	content_resume()
 	content_limits()
 	content_flow()
+	content_require_change()
+	content_stalls()
+	content_new_session()
+	content_bad_source()
+	content_rehash()
+	content_items()
 	print("LOCALNET: %d checks, %d failures" % [checks, failures.size()])
 	for failure in failures:
 		print("  FAIL ", failure)
@@ -1521,3 +1527,275 @@ func content_flow() -> void:
 		c.close()
 	for l in pair:
 		l.leave()
+
+
+# Chunks in flight to [param id] across all of [param content]'s transfers.
+func in_flight_to(content: LocalNetContent, id: int) -> int:
+	var total := 0
+	for send in content._sends.values():
+		if send.id == id:
+			total += send.in_flight.size()
+	return total
+
+
+# The host changes what the match needs mid-transfer, both ways round: the fetch that's
+# called off frees the sender's window, so the new item still comes through.
+func content_require_change() -> void:
+	var pair := joined_pair()
+	var host: LocalNetLobby = pair[0]
+	var guest: LocalNetLobby = pair[1]
+	var hc := content_for(host, "change-host")
+	var gc := content_for(guest, "change-guest")
+	var everything := pair + [hc, gc]
+	var old_bytes := blob(4 * 1024 * 1024)
+	var old := LocalNetContent.describe("track", "old", old_bytes)
+	var new_bytes := blob(100_000)
+	var new := LocalNetContent.describe("track", "new", new_bytes)
+	hc.offer(old, old_bytes)
+	hc.offer(new, new_bytes)
+	hc.require([old])
+	var log := []
+	var got := []
+	gc.progress.connect(func(_h, b, _t): log.append(b))
+	gc.received.connect(func(i, _path): got.append(i.id))
+	pump(everything, 5.0, func(): return not log.is_empty() and log.back() > 256 * 1024)
+	var cancels := [0]
+	host.link.received.connect(func(_id, channel, b):
+		if channel == LocalNetLink.CHANNEL_CONTENT and b[0] == LocalNetContent.KIND_CANCEL:
+			cancels[0] += 1)
+	hc.require([new])
+	var most := [0]
+	pump(everything, 5.0, func():
+		most[0] = maxi(most[0], in_flight_to(hc, guest.local_id))
+		return got.has("new"))
+	check(got == ["new"] and cancels[0] >= 1, "A guest gets the new item after the host changes what's needed mid-transfer, calling the old one off: %s" % [got])
+	pump(everything, 0.5)
+	check(hc._sends.is_empty() and gc._fetches.is_empty() and most[0] <= LocalNetContent.WINDOW, "...the old transfer is called off at both ends, and the window held (%d sends, at most %d in flight)" % [hc._sends.size(), most[0]])
+	check(FileAccess.file_exists(gc.cache_dir.path_join(old.hash + ".part")), "...keeping what came of the old item for later")
+	for c in [hc, gc]:
+		c.close()
+	for l in pair:
+		l.leave()
+	# The host fetching from a guest, the other way round.
+	pair = joined_pair()
+	host = pair[0]
+	guest = pair[1]
+	hc = content_for(host, "change-host")
+	gc = content_for(guest, "change-guest")
+	everything = pair + [hc, gc]
+	gc.offer(old, old_bytes)
+	gc.offer(new, new_bytes)
+	hc.require([old])
+	log = []
+	got = []
+	hc.progress.connect(func(_h, b, _t): log.append(b))
+	hc.received.connect(func(i, _path): got.append(i.id))
+	pump(everything, 5.0, func(): return not log.is_empty() and log.back() > 256 * 1024)
+	hc.require([new])
+	pump(everything, 5.0, func(): return got.has("new"))
+	pump(everything, 0.5)
+	check(got == ["new"] and gc._sends.is_empty(), "So does a host fetching from a guest: %s, %d sends left" % [got, gc._sends.size()])
+	for c in [hc, gc]:
+		c.close()
+	for l in pair:
+		l.leave()
+
+
+# What a sender does with WANTs it already has a transfer for, or that ask past the end,
+# and what each side does when a transfer goes quiet.
+func content_stalls() -> void:
+	var pair := joined_pair()
+	var host: LocalNetLobby = pair[0]
+	var guest: LocalNetLobby = pair[1]
+	var hc := content_for(host, "stall-host")
+	var gc := content_for(guest, "stall-guest")
+	var everything := pair + [hc, gc]
+	var bytes := blob(1024 * 1024)
+	var item := LocalNetContent.describe("track", "quiet", bytes)
+	hc.offer(item, bytes)
+	var id := guest.local_id
+	var key := "%d:%s" % [id, item.hash]
+	# Nobody asked the guest to fetch it, so it ignores the chunks: a cancel that went astray.
+	hc._on_want(id, item.hash, 0)
+	hc.poll()
+	check(in_flight_to(hc, id) == LocalNetContent.WINDOW, "A transfer fills the window (%d)" % in_flight_to(hc, id))
+	hc._on_want(id, item.hash, 0)
+	hc._on_want(id, item.hash, LocalNetContent.CHUNK_BYTES)
+	var send: Dictionary = hc._sends[key]
+	check(send.in_flight.size() == LocalNetContent.WINDOW and send.cursor == LocalNetContent.WINDOW * LocalNetContent.CHUNK_BYTES, "Asking again for what's already on its way changes nothing")
+	hc._on_want(id, item.hash, LocalNetContent.WINDOW * LocalNetContent.CHUNK_BYTES * 2)
+	hc.poll()
+	check(send.in_flight.size() == LocalNetContent.WINDOW and send.cursor == LocalNetContent.WINDOW * LocalNetContent.CHUNK_BYTES * 2, "Asking from somewhere else moves on without sending past the window (%d in flight)" % send.in_flight.size())
+	hc._on_want(id, item.hash, LocalNetContent.CHUNK_BYTES * 5)
+	check(send.cursor == LocalNetContent.CHUNK_BYTES * 5 and send.in_flight.size() == LocalNetContent.WINDOW, "...and so does asking for a chunk that isn't on its way: chunks in flight stay counted")
+	pump(everything, 0.5)
+	check(hc._sends.has(key) and in_flight_to(hc, id) == LocalNetContent.WINDOW, "Chunks nobody acknowledges keep the window full...")
+	send.last_usec -= LocalNetContent.STALL_USEC
+	hc.poll()
+	check(not hc._sends.has(key), "...until the transfer has been quiet for STALL_USEC, when the sender lets it go")
+	var other := LocalNetContent.describe("track", "other", blob(1000))
+	hc.offer(other, blob(1000))
+	hc._on_want(id, item.hash, item.size)
+	hc._on_want(id, item.hash, item.size + 5)
+	check(hc._sends.is_empty(), "A WANT from the end or past it starts nothing")
+	# The guest's side: a fetch that goes quiet asks again.
+	hc.require([item])
+	var wants := [0]
+	host.link.received.connect(func(_from, channel, b):
+		if channel == LocalNetLink.CHANNEL_CONTENT and b[0] == LocalNetContent.KIND_WANT:
+			wants[0] += 1)
+	pump(everything, 3.0, func(): return gc._fetches.has(item.hash) and gc._fetches[item.hash].state == "fetching" and wants[0] > 0)
+	# The host forgets it, as a sender that let it go would; what was in flight lands.
+	hc._sends.clear()
+	pump(everything, 0.3)
+	var asked: int = wants[0]
+	gc._fetches[item.hash].last_usec -= LocalNetContent.STALL_USEC
+	var got := []
+	gc.received.connect(func(_i, path): got.append(path))
+	pump(everything, 5.0, func(): return not got.is_empty())
+	check(wants[0] > asked and got.size() == 1 and FileAccess.get_file_as_bytes(got[0]) == bytes, "A guest whose fetch goes quiet asks again, and gets it all")
+	for c in [hc, gc]:
+		c.close()
+	for l in pair:
+		l.leave()
+
+
+# A lobby that leaves and opens a new session starts its transfers afresh: ids start at 2
+# again, so old ones would go to the wrong member.
+func content_new_session() -> void:
+	var pair := joined_pair()
+	var host: LocalNetLobby = pair[0]
+	var guest: LocalNetLobby = pair[1]
+	var hc := content_for(host, "session-host")
+	var gc := content_for(guest, "session-guest")
+	var bytes := blob(4 * 1024 * 1024)
+	var item := LocalNetContent.describe("track", "long", bytes)
+	hc.offer(item, bytes)
+	hc.require([item])
+	var log := []
+	gc.progress.connect(func(_h, b, _t): log.append(b))
+	pump(pair + [hc, gc], 5.0, func(): return not log.is_empty() and log.back() > 256 * 1024)
+	check(not hc._sends.is_empty() and not gc._fetches.is_empty(), "Both ends are mid-transfer")
+	host.leave()
+	guest.leave()
+	host.host("Host", 2)
+	guest.join("127.0.0.1", host.link.port, "Guest")
+	hc.poll()
+	gc.poll()
+	check(hc._sends.is_empty() and gc._fetches.is_empty(), "A new session starts with no transfers left from the last")
+	var stray := [0]
+	guest.link.received.connect(func(_id, channel, b):
+		if channel == LocalNetLink.CHANNEL_CONTENT and b[0] == LocalNetContent.KIND_CHUNK:
+			stray[0] += 1)
+	pump(pair + [hc, gc], 3.0, func(): return host.can_start())
+	check(host.can_start() and stray[0] == 0, "...and the new guest is sent nothing it didn't ask for (%d chunks)" % stray[0])
+	for c in [hc, gc]:
+		c.close()
+	for l in pair:
+		l.leave()
+
+
+# The host passes content on, so one member's bad copy mustn't stop it: it asks the next
+# member, and only fails once nobody is left, still asking members who join later.
+func content_bad_source() -> void:
+	var host := host_lobby(3)
+	var bad := join_lobby(host, "Bad")
+	var good := join_lobby(host, "Good")
+	var lobbies := [host, bad, good]
+	pump(lobbies, 5.0, func(): return host.can_start() and host.members.size() == 3)
+	var hc := content_for(host, "bad-host")
+	var bc := content_for(bad, "bad-bad")
+	var gc := content_for(good, "bad-good")
+	var bytes := blob(100_000)
+	var item := LocalNetContent.describe("car", "bakkie", bytes)
+	var tampered := bytes.duplicate()
+	tampered[10] ^= 0xFF
+	bc.offer(item, tampered)
+	gc.offer(item, bytes)
+	hc.require([item])
+	var failures := []
+	var got := []
+	hc.failed.connect(func(_i, reason): failures.append(reason))
+	hc.received.connect(func(_i, path): got.append(path))
+	pump(lobbies + [hc, bc, gc], 6.0, func(): return not got.is_empty() and host.can_start(false, true))
+	check(got.size() == 1 and FileAccess.get_file_as_bytes(got[0]) == bytes and failures.is_empty(), "A host given a bad copy asks the next member, and says nothing failed: %s" % [failures])
+	check(host.can_start(false, true), "...so everyone ends up with the right bytes")
+	for c in [hc, bc, gc]:
+		c.close()
+	for l in lobbies:
+		l.leave()
+	# Only a bad copy to be had: it fails once, then a member who joins with a good one is asked.
+	host = host_lobby(3)
+	bad = join_lobby(host, "Bad")
+	pump([host, bad], 5.0, func(): return host.can_start())
+	hc = content_for(host, "bad-host")
+	bc = content_for(bad, "bad-bad")
+	bc.offer(item, tampered)
+	hc.require([item])
+	failures = []
+	got = []
+	hc.failed.connect(func(_i, reason): failures.append(reason))
+	hc.received.connect(func(_i, path): got.append(path))
+	pump([host, bad, hc, bc], 3.0)
+	check(failures == ["Didn't match its hash"] and not hc.has(item.hash), "With only a bad copy about, the host fails once: %s" % [failures])
+	good = join_lobby(host, "Good")
+	gc = content_for(good, "bad-good")
+	gc.offer(item, bytes)
+	pump([host, bad, good, hc, bc, gc], 8.0, func(): return not got.is_empty())
+	check(got.size() == 1 and FileAccess.get_file_as_bytes(got[0]) == bytes and failures.size() == 1, "...and fetches it from a member who joins later with a good one, without asking the bad one again")
+	for c in [hc, bc, gc]:
+		c.close()
+	for l in [host, bad, good]:
+		l.leave()
+
+
+# A partial download is hashed a little each frame when it resumes, so a big one never
+# holds up a frame.
+func content_rehash() -> void:
+	var pair := joined_pair()
+	var host: LocalNetLobby = pair[0]
+	var guest: LocalNetLobby = pair[1]
+	var hc := content_for(host, "rehash-host")
+	var gc := content_for(guest, "rehash-guest")
+	var bytes := blob(4 * 1024 * 1024)
+	var item := LocalNetContent.describe("track", "long", bytes)
+	var done := 3 * 1024 * 1024
+	var part := FileAccess.open(gc.cache_dir.path_join(item.hash + ".part"), FileAccess.WRITE)
+	part.store_buffer(bytes.slice(0, done))
+	part.close()
+	gc.hash_budget_bytes = 256 * 1024
+	hc.offer(item, bytes)
+	hc.require([item])
+	pump([host, hc, guest], 2.0, func(): return not guest.needed_content.is_empty())
+	gc.poll()
+	gc.poll()
+	var fetch: Dictionary = gc._fetches.get(item.hash, {})
+	check(fetch.get("state") == "hashing" and fetch.get("offset") == 256 * 1024, "Resuming hashes hash_budget_bytes of the partial file a frame (%s, %s)" % [fetch.get("state"), fetch.get("offset")])
+	var first := []
+	var got := []
+	gc.progress.connect(func(_h, b, _t): if first.is_empty(): first.append(b))
+	gc.received.connect(func(_i, path): got.append(path))
+	pump(pair + [hc, gc], 10.0, func(): return not got.is_empty())
+	check(not first.is_empty() and first[0] == done + LocalNetContent.CHUNK_BYTES, "...then carries on from the end of it (%s)" % [first])
+	check(got.size() == 1 and FileAccess.get_file_as_bytes(got[0]) == bytes, "...and the result matches byte for byte")
+	for c in [hc, gc]:
+		c.close()
+	for l in pair:
+		l.leave()
+
+
+func content_items() -> void:
+	var content := LocalNetContent.new(LocalNetLobby.new(GAME, 1))
+	var digits := "0123456789abcdef".repeat(4)
+	check(content._valid({"hash": digits, "size": 1}), "A hash is 64 lowercase hex digits")
+	var odd := ["+" + digits.right(63), "-" + digits.right(63), digits.to_upper(), digits.left(63), digits + "0", digits.left(63) + "g", "0x" + digits.right(62)]
+	check(odd.all(func(h): return not content._valid({"hash": h, "size": 1})), "...and nothing else: no sign, capitals, prefix or other length")
+	content.offer({"type": "stage", "id": "odd", "hash": odd[0], "size": 1}, PackedByteArray([1]))
+	check(not content.has(odd[0]), "An item with a malformed hash can't be offered")
+	content.close()
+	# describe() touches nothing shared, so a game can run it on a worker thread.
+	var bytes := blob(2 * 1024 * 1024)
+	var on_thread := [{}]
+	var task := WorkerThreadPool.add_task(func(): on_thread[0] = LocalNetContent.describe("mod", "big", bytes))
+	WorkerThreadPool.wait_for_task_completion(task)
+	check(on_thread[0] == LocalNetContent.describe("mod", "big", bytes), "describe() gives the same item on a worker thread")

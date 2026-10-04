@@ -139,6 +139,9 @@ var _next_host_report_usec := 0
 var _start_at := 0
 var _role := PLAYER
 var _needed_key := ""
+# Counts the sessions this lobby has opened with [method host] or [method join], so
+# [LocalNetContent] can tell a new one from the last.
+var _session := 0
 
 
 func _init(game: String, game_version: int) -> void:
@@ -162,6 +165,7 @@ func host(player_name: String, players := 2, join_code := "", port := 0, host_pl
 	if err != OK:
 		return err
 	is_host = true
+	_session += 1
 	local_id = LocalNetLink.HOST_ID
 	max_players = players
 	session_id = "%08x%08x" % [randi(), randi()]
@@ -183,6 +187,7 @@ func join(address: String, port: int, player_name: String, join_code := "", role
 	if err != OK:
 		return err
 	is_host = false
+	_session += 1
 	_name = player_name
 	_role = SPECTATOR if role == SPECTATOR else PLAYER
 	needed_content = []

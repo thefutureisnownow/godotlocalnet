@@ -26,7 +26,14 @@ extends RefCounted
 ## [member cache_dir] and continue from where they stopped after a dropped connection, a
 ## rematch or a fresh start of the app. A finished download is checked against its hash
 ## before it's renamed to [code]<hash>[/code]; one that doesn't match is thrown away and
-## [signal failed] says so.
+## [signal failed] says so. On the host, which passes content on, a member whose copy
+## didn't match isn't asked again: the host asks the next member, and only says it failed
+## once nobody is left to ask.
+##
+## A transfer that's no longer wanted (the host changed what the match needs) is called off
+## with a cancel, so the sender frees its window at once. A transfer that goes quiet for
+## [constant STALL_USEC] while it should be moving is let go by the sender and asked for
+## again by the fetcher, so nothing lost along the way can hold up a peer for good.
 ##
 ## A device only accepts chunks of items it asked for, and only serves items it offered
 ## (the host also serves items the match needs that it has fetched). Never load downloaded
@@ -48,6 +55,7 @@ const KIND_WANT := 20
 const KIND_CHUNK := 21
 const KIND_ACK := 22
 const KIND_NOPE := 23
+const KIND_CANCEL := 24
 ## Why a request was refused: the device doesn't have the item, nobody in the lobby has it,
 ## or its source couldn't be read.
 enum { NOPE_MISSING = 1, NOPE_UNAVAILABLE, NOPE_UNREADABLE }
@@ -60,6 +68,11 @@ const FETCHES := 4
 const RETRY_USEC := 2_000_000
 ## How often an unacknowledged report of what's missing is sent again.
 const REPORT_USEC := 1_000_000
+## How long a transfer may go quiet while it should be moving: a fetch with no chunk
+## arriving, or chunks sent and never acknowledged. Then the sender lets it go, and the
+## fetcher asks again (a guest asks the host; the host asks the next member). Time spent
+## in a match, when transfers pause, doesn't count.
+const STALL_USEC := 5_000_000
 const _HEADER := 37
 
 var lobby: LocalNetLobby
@@ -69,19 +82,30 @@ var cache_dir := "user://localnet_content"
 var max_item_bytes := 32 * 1024 * 1024
 ## Bytes of chunks sent per frame, across every transfer.
 var budget_bytes := 131_072
+## Bytes of a partial download hashed per frame when it resumes from its
+## [code].part[/code] file, so a big one doesn't hold up a frame. About 2 ms on a laptop.
+var hash_budget_bytes := 1 << 20
 
 var _offers := {}
 var _fetches := {}
 var _sends := {}
 var _held := {}
+# "id:hash" of transfers this device called off. Chunks still arriving for them are
+# answered with another cancel, in case the first went astray.
+var _abandoned := {}
 var _reported := {}
 var _next_report_usec := 0
 var _present_key := ""
 var _signals := []
+var _session := 0
+var _paused := false
+var _turn := 0
+var _hex := RegEx.create_from_string("^[0-9a-f]{64}$")
 
 
 func _init(lobby_to_use: LocalNetLobby) -> void:
 	lobby = lobby_to_use
+	_session = lobby._session
 	_signals = [
 		[lobby.link.received, _on_received],
 		[lobby.member_left, _on_member_left],
@@ -94,15 +118,20 @@ func _init(lobby_to_use: LocalNetLobby) -> void:
 
 
 ## Stops listening and closes any open files. Partial downloads stay for next time.
+## Members this device was fetching from or sending to are told, so they can move on.
 func close() -> void:
 	for pair in _signals:
 		if pair[0].is_connected(pair[1]):
 			pair[0].disconnect(pair[1])
-	_reset()
+	_reset(true)
 
 
-## An item for [param source]: a [PackedByteArray] or a file path. Hashes the whole thing.
-## Empty if the file can't be read.
+## An item for [param source]: a [PackedByteArray] or a file path. Hashes the whole thing
+## before it returns, at roughly 400 MB/s on a laptop and a few times slower on a phone: a
+## 32 MB item takes about 80 ms on a laptop and a few hundred on a phone. A game describes
+## its own content once (when it's installed, say) and can keep the item with it. For big
+## items, call it from a thread ([method WorkerThreadPool.add_task]): it touches nothing
+## shared. Empty if the file can't be read.
 static func describe(type: String, id: String, source: Variant) -> Dictionary:
 	var hashing := HashingContext.new()
 	hashing.start(HashingContext.HASH_SHA256)
@@ -157,14 +186,24 @@ func missing() -> Array:
 
 
 func poll() -> void:
+	_check_session()
 	if not lobby.link.is_open():
 		return
 	_follow_needs()
 	if lobby.state != "lobby":
+		_paused = true
 		return
 	var now := Time.get_ticks_usec()
+	if _paused:
+		# A match isn't a stall.
+		_paused = false
+		for fetch in _fetches.values():
+			fetch.last_usec = now
+		for send in _sends.values():
+			send.last_usec = now
+	_rehash()
 	_request(now)
-	_serve()
+	_serve(now)
 	_report(now)
 	lobby.link.flush()
 
@@ -176,8 +215,7 @@ func _path(hash: String) -> String:
 func _valid(item) -> bool:
 	if not item is Dictionary or not item.get("hash") is String or not item.get("size") is int:
 		return false
-	var hash: String = item.hash
-	return hash.length() == 64 and hash == hash.to_lower() and hash.is_valid_hex_number() and item.size >= 0
+	return _hex.search(item.hash) != null and item.size >= 0
 
 
 func _needed() -> Dictionary:
@@ -195,29 +233,42 @@ func _follow_needs() -> void:
 		if _fetches.has(hash) or has(hash):
 			continue
 		var item: Dictionary = needed[hash]
-		_fetches[hash] = {"item": item, "from": 0, "offset": 0, "state": "idle", "tried": [], "retry_at": 0, "told": false, "file": null, "hashing": null, "gap": -1}
+		# bad: members whose copy didn't match (the host doesn't ask them again).
+		# length: how much of the .part file is still to be hashed on resuming.
+		_fetches[hash] = {"item": item, "from": 0, "offset": 0, "length": 0, "state": "idle", "tried": [], "bad": [], "retry_at": 0, "last_usec": 0, "told": "", "file": null, "hashing": null, "gap": -1}
 		if item.size > max_item_bytes:
 			_fail(hash, "Too big (%d bytes, at most %d)" % [item.size, max_item_bytes])
 	for hash in _fetches.keys():
 		if not needed.has(hash):
-			if _fetches[hash].file:
-				_fetches[hash].file.close()
+			# Called off: the sender is told, so its window frees up.
+			var fetch: Dictionary = _fetches[hash]
+			if fetch.state == "fetching":
+				_abandon(fetch.from, hash)
+			if fetch.file:
+				fetch.file.close()
 			_fetches.erase(hash)
 			_held.erase(hash)
 
 
 func _request(now: int) -> void:
-	var fetching := _fetches.values().filter(func(fetch): return fetch.state == "fetching").size()
 	for hash in _fetches.keys():
 		var fetch: Dictionary = _fetches[hash]
 		if fetch.state == "waiting" and now >= fetch.retry_at:
 			fetch.state = "idle"
 			fetch.tried = []
+		elif fetch.state == "fetching" and now - fetch.last_usec >= STALL_USEC:
+			_stalled(hash, fetch, now)
+	var fetching := _fetches.values().filter(func(fetch): return fetch.state == "fetching").size()
+	for hash in _fetches.keys():
+		var fetch: Dictionary = _fetches[hash]
 		if fetch.state != "idle" or fetching >= FETCHES:
 			continue
-		if fetch.file == null and not _open_part(fetch):
-			_fail(hash, "Couldn't write to %s" % cache_dir)
-			continue
+		if fetch.file == null:
+			if not _open_part(fetch):
+				_fail(hash, "Couldn't write to %s" % cache_dir)
+				continue
+			if fetch.state == "hashing":
+				continue
 		if fetch.offset >= fetch.item.size:
 			_finish(hash)
 			continue
@@ -228,15 +279,36 @@ func _request(now: int) -> void:
 			fetch.state = "waiting"
 			fetch.retry_at = now + RETRY_USEC
 			_refuse_held(hash)
-			if not fetch.told:
-				fetch.told = true
-				failed.emit(fetch.item, "Nobody has it")
+			_tell(fetch, "Didn't match its hash" if not fetch.bad.is_empty() else "Nobody has it")
 			continue
 		fetch.from = source
 		fetch.state = "fetching"
 		fetch.gap = -1
+		fetch.last_usec = now
+		_abandoned.erase("%d:%s" % [source, hash])
 		fetching += 1
 		_send_want(source, hash, fetch.offset)
+
+
+# Nothing has arrived for [constant STALL_USEC]. A guest asks the host again; the host
+# calls it off and asks the next member.
+func _stalled(hash: String, fetch: Dictionary, now: int) -> void:
+	if lobby.is_host:
+		_abandon(fetch.from, hash)
+		fetch.tried.append(fetch.from)
+		fetch.from = 0
+		fetch.state = "idle"
+		return
+	fetch.last_usec = now
+	fetch.gap = -1
+	_send_want(fetch.from, hash, fetch.offset)
+
+
+# [signal failed], once for each reason.
+func _tell(fetch: Dictionary, reason: String) -> void:
+	if fetch.told != reason:
+		fetch.told = reason
+		failed.emit(fetch.item, reason)
 
 
 # Who to ask: guests ask the host; the host asks each guest in turn. 0 when nobody is
@@ -249,7 +321,7 @@ func _pick_source(fetch: Dictionary) -> int:
 	var ids := lobby.members.keys()
 	ids.sort()
 	for id in ids:
-		if id != lobby.local_id and not fetch.tried.has(id) and lobby.link.is_peer_connected(id):
+		if id != lobby.local_id and not fetch.tried.has(id) and not fetch.bad.has(id) and lobby.link.is_peer_connected(id):
 			return id
 	return 0
 
@@ -267,17 +339,40 @@ func _open_part(fetch: Dictionary) -> bool:
 		if file == null:
 			return false
 		length = 0
-	# Picks up the hash of what an earlier session already wrote.
-	var hashing := HashingContext.new()
-	hashing.start(HashingContext.HASH_SHA256)
-	file.seek(0)
-	while file.get_position() < length:
-		hashing.update(file.get_buffer(mini(length - file.get_position(), 1 << 20)))
-	file.seek(length)
 	fetch.file = file
-	fetch.hashing = hashing
-	fetch.offset = length
+	fetch.hashing = HashingContext.new()
+	fetch.hashing.start(HashingContext.HASH_SHA256)
+	fetch.offset = 0
+	fetch.length = length
+	if length > 0:
+		# What an earlier session already wrote is hashed a little each frame
+		# ([method _rehash]) before the download carries on from there.
+		fetch.state = "hashing"
+		file.seek(0)
 	return true
+
+
+# Hashes partial downloads being resumed, [member hash_budget_bytes] a frame across all
+# of them.
+func _rehash() -> void:
+	var budget := hash_budget_bytes
+	for fetch in _fetches.values():
+		if budget <= 0:
+			return
+		if fetch.state != "hashing":
+			continue
+		while budget > 0 and fetch.offset < fetch.length:
+			var data: PackedByteArray = fetch.file.get_buffer(mini(fetch.length - fetch.offset, mini(budget, 1 << 20)))
+			if data.is_empty():
+				# Unreadable from here on: fetch the rest again.
+				fetch.length = fetch.offset
+				fetch.file.seek(fetch.offset)
+				break
+			fetch.hashing.update(data)
+			fetch.offset += data.size()
+			budget -= data.size()
+		if fetch.offset >= fetch.length:
+			fetch.state = "idle"
 
 
 func _finish(hash: String) -> void:
@@ -288,7 +383,7 @@ func _finish(hash: String) -> void:
 	if fetch.hashing.finish().hex_encode() != hash:
 		DirAccess.remove_absolute(part)
 		fetch.hashing = null
-		_fail(hash, "Didn't match its hash")
+		_bad_copy(hash, "Didn't match its hash")
 		return
 	if FileAccess.file_exists(_path(hash)):
 		DirAccess.remove_absolute(_path(hash))
@@ -302,6 +397,31 @@ func _finish(hash: String) -> void:
 	for id in waiting:
 		_start_send(id, hash, waiting[id])
 	received.emit(fetch.item, _path(hash))
+
+
+# Bytes that turned out wrong. A guest gives up on the item ([signal failed]). The host,
+# which passes content on, throws them away and asks another member instead: one bad copy
+# mustn't stop it serving everyone else. It doesn't ask that member again, and says it
+# failed once nobody is left to ask ([method _request]). A whole partial file left from an
+# earlier session that doesn't match is simply fetched again.
+func _bad_copy(hash: String, reason: String) -> void:
+	var fetch: Dictionary = _fetches[hash]
+	if fetch.from != 0 and not lobby.is_host:
+		_fail(hash, reason)
+		return
+	if fetch.from != 0:
+		_abandon(fetch.from, hash)
+		fetch.bad.append(fetch.from)
+	if fetch.file:
+		fetch.file.close()
+		fetch.file = null
+	DirAccess.remove_absolute(_path(hash) + ".part")
+	fetch.hashing = null
+	fetch.from = 0
+	fetch.offset = 0
+	fetch.length = 0
+	fetch.gap = -1
+	fetch.state = "idle"
 
 
 func _fail(hash: String, reason: String) -> void:
@@ -338,9 +458,21 @@ func _start_send(id: int, hash: String, offset: int) -> void:
 	if offered.is_empty():
 		_send_nope(id, hash, NOPE_MISSING)
 		return
+	# Nothing to send from past the end; a fetcher with everything never asks.
+	if offset >= offered.item.size:
+		return
 	var key := "%d:%s" % [id, hash]
-	_close_send(key)
-	_sends[key] = {"id": id, "hash": hash, "raw": hash.hex_decode(), "size": offered.item.size, "source": offered.source, "file": null, "cursor": clampi(offset, 0, offered.item.size), "in_flight": []}
+	var now := Time.get_ticks_usec()
+	if _sends.has(key):
+		# Asked again. If that chunk is on its way, or next, nothing changes; otherwise it
+		# carries on from where the other side is. Chunks still in flight stay counted
+		# until they're acknowledged (every chunk is), so the window holds.
+		var send: Dictionary = _sends[key]
+		if offset != send.cursor and not send.in_flight.has(offset):
+			send.cursor = offset
+		send.last_usec = now
+		return
+	_sends[key] = {"id": id, "hash": hash, "raw": hash.hex_decode(), "size": offered.item.size, "source": offered.source, "file": null, "cursor": offset, "in_flight": [], "last_usec": now}
 
 
 func _close_send(key: String) -> void:
@@ -350,16 +482,29 @@ func _close_send(key: String) -> void:
 
 
 # Sends chunks round the transfers, one each per pass, within each peer's window and the
-# frame's budget.
-func _serve() -> void:
+# frame's budget. Each frame starts with the next transfer, so every peer gets its turn.
+func _serve(now: int) -> void:
 	var flying := {}
-	for send in _sends.values():
+	for key in _sends.keys():
+		var send: Dictionary = _sends[key]
+		# Chunks nobody acknowledges: the other side called it off and the word went
+		# astray, or it went quiet. Let it go; it asks again if it still wants it.
+		if (not send.in_flight.is_empty() and now - send.last_usec >= STALL_USEC) or (send.cursor >= send.size and send.in_flight.is_empty()):
+			_close_send(key)
+			continue
 		flying[send.id] = flying.get(send.id, 0) + send.in_flight.size()
+	var keys := _sends.keys()
+	if keys.is_empty():
+		return
+	_turn = (_turn + 1) % keys.size()
+	keys = keys.slice(_turn) + keys.slice(0, _turn)
 	var budget := budget_bytes
 	var sent := true
 	while sent and budget > 0:
 		sent = false
-		for key in _sends.keys():
+		for key in keys:
+			if not _sends.has(key):
+				continue
 			var send: Dictionary = _sends[key]
 			if flying[send.id] >= WINDOW or send.cursor >= send.size or not lobby.link.is_peer_connected(send.id):
 				continue
@@ -373,6 +518,7 @@ func _serve() -> void:
 			packet.append_array(data)
 			lobby.link.send(send.id, LocalNetLink.CHANNEL_CONTENT, packet, true)
 			send.in_flight.append(send.cursor)
+			send.last_usec = now
 			flying[send.id] += 1
 			send.cursor += length
 			budget -= length
@@ -414,6 +560,7 @@ func _report(now: int) -> void:
 
 
 func _on_received(id: int, channel: int, bytes: PackedByteArray) -> void:
+	_check_session()
 	if channel != LocalNetLink.CHANNEL_CONTENT or bytes.size() < _HEADER - 4:
 		return
 	# Guests only hear from the host, and the host only from members.
@@ -421,6 +568,9 @@ func _on_received(id: int, channel: int, bytes: PackedByteArray) -> void:
 		return
 	var hash := bytes.slice(1, 33).hex_encode()
 	var kind := bytes[0]
+	if kind == KIND_CANCEL:
+		_on_cancel(id, hash)
+		return
 	if kind == KIND_NOPE:
 		if bytes.size() > 33:
 			_on_nope(id, hash, bytes[33])
@@ -437,7 +587,7 @@ func _on_received(id: int, channel: int, bytes: PackedByteArray) -> void:
 func _on_want(id: int, hash: String, offset: int) -> void:
 	if not _source_for(hash).is_empty():
 		_start_send(id, hash, offset)
-	elif lobby.is_host and _fetches.has(hash) and _fetches[hash].state in ["idle", "fetching"]:
+	elif lobby.is_host and _fetches.has(hash) and _fetches[hash].state in ["idle", "hashing", "fetching"]:
 		# Still fetching it from a guest: pass it on once it's here.
 		_held.get_or_add(hash, {})[id] = offset
 	else:
@@ -449,9 +599,14 @@ func _on_chunk(id: int, hash: String, offset: int, data: PackedByteArray) -> voi
 	var fetch: Dictionary = _fetches.get(hash, {})
 	# Only items this device asked for, from the device it asked.
 	if fetch.is_empty() or fetch.state != "fetching" or fetch.from != id or data.is_empty():
+		# Still coming from a transfer this device called off: say so again.
+		if _abandoned.has("%d:%s" % [id, hash]):
+			_send_cancel(id, hash)
 		return
+	fetch.last_usec = Time.get_ticks_usec()
+	# Every chunk from the source is acknowledged, kept or not, so its window frees up.
+	_send_ack(id, hash, offset)
 	if offset < fetch.offset:
-		_send_ack(id, hash, offset)
 		return
 	if offset > fetch.offset:
 		# Something went missing (a reconnect); ask again from where this device is.
@@ -460,7 +615,7 @@ func _on_chunk(id: int, hash: String, offset: int, data: PackedByteArray) -> voi
 			_send_want(id, hash, fetch.offset)
 		return
 	if offset + data.size() > fetch.item.size:
-		_fail(hash, "Bigger than its size")
+		_bad_copy(hash, "Bigger than its size")
 		return
 	fetch.file.store_buffer(data)
 	if fetch.file.get_error() != OK:
@@ -468,7 +623,6 @@ func _on_chunk(id: int, hash: String, offset: int, data: PackedByteArray) -> voi
 		return
 	fetch.hashing.update(data)
 	fetch.offset += data.size()
-	_send_ack(id, hash, offset)
 	progress.emit(hash, fetch.offset, fetch.item.size)
 	if fetch.offset >= fetch.item.size:
 		_finish(hash)
@@ -480,11 +634,21 @@ func _on_ack(id: int, hash: String, offset: int) -> void:
 		return
 	var send: Dictionary = _sends[key]
 	send.in_flight.erase(offset)
+	send.last_usec = Time.get_ticks_usec()
 	if send.cursor >= send.size and send.in_flight.is_empty():
 		_close_send(key)
 
 
+# The other side doesn't want it any more.
+func _on_cancel(id: int, hash: String) -> void:
+	_close_send("%d:%s" % [id, hash])
+	if _held.has(hash):
+		_held[hash].erase(id)
+
+
 func _on_nope(id: int, hash: String, reason: int) -> void:
+	# Whatever this device was sending it for that hash is over too.
+	_close_send("%d:%s" % [id, hash])
 	var fetch: Dictionary = _fetches.get(hash, {})
 	if fetch.is_empty() or fetch.state != "fetching" or fetch.from != id:
 		return
@@ -496,13 +660,12 @@ func _on_nope(id: int, hash: String, reason: int) -> void:
 		return
 	fetch.state = "waiting"
 	fetch.retry_at = Time.get_ticks_usec() + RETRY_USEC
-	if not fetch.told:
-		fetch.told = true
-		failed.emit(fetch.item, "Couldn't be read" if reason == NOPE_UNREADABLE else "Nobody has it")
+	_tell(fetch, "Couldn't be read" if reason == NOPE_UNREADABLE else "Nobody has it")
 
 
 # Host: a member left; whatever it was sending is asked of someone else.
 func _on_member_left(id: int, _reason: String) -> void:
+	_check_session()
 	_forget_peer(id)
 	for hash in _fetches:
 		var fetch: Dictionary = _fetches[hash]
@@ -514,6 +677,7 @@ func _on_member_left(id: int, _reason: String) -> void:
 # Host: a member is back. Anything in flight was lost: it asks again for what it was
 # fetching, and this device asks again for what it was fetching from it.
 func _on_member_resumed(id: int) -> void:
+	_check_session()
 	if not lobby.is_host:
 		return
 	_forget_peer(id)
@@ -522,6 +686,7 @@ func _on_member_resumed(id: int) -> void:
 
 # Guest: back with the host.
 func _on_connection_resumed() -> void:
+	_check_session()
 	_forget_peer(LocalNetLink.HOST_ID)
 	_ask_again(LocalNetLink.HOST_ID)
 
@@ -532,6 +697,9 @@ func _forget_peer(id: int) -> void:
 			_close_send(key)
 	for hash in _held:
 		_held[hash].erase(id)
+	for key in _abandoned.keys():
+		if key.begins_with("%d:" % id):
+			_abandoned.erase(key)
 
 
 func _ask_again(id: int) -> void:
@@ -539,6 +707,7 @@ func _ask_again(id: int) -> void:
 		var fetch: Dictionary = _fetches[hash]
 		if fetch.from == id and fetch.state == "fetching":
 			fetch.gap = -1
+			fetch.last_usec = Time.get_ticks_usec()
 			_send_want(id, hash, fetch.offset)
 	lobby.link.flush()
 
@@ -547,7 +716,28 @@ func _on_closed(_reason: String) -> void:
 	_reset()
 
 
-func _reset() -> void:
+# A new session ([method LocalNetLobby.leave], then [method LocalNetLobby.host] or
+# [method LocalNetLobby.join] again) starts afresh. Ids start again at 2, so a transfer
+# left over from the last one would go to the wrong member, and a host never emits
+# [signal LocalNetLobby.closed].
+func _check_session() -> void:
+	if _session != lobby._session:
+		_session = lobby._session
+		_reset()
+
+
+# Forgets every transfer. With [param tell], the members on the other end hear that
+# they're over.
+func _reset(tell := false) -> void:
+	if tell and lobby.link.is_open() and _session == lobby._session:
+		for hash in _fetches:
+			if _fetches[hash].state == "fetching":
+				_send_cancel(_fetches[hash].from, hash)
+		for send in _sends.values():
+			_send_nope(send.id, send.hash, NOPE_MISSING)
+		for hash in _held.keys():
+			_refuse_held(hash)
+		lobby.link.flush()
 	for fetch in _fetches.values():
 		if fetch.file:
 			fetch.file.close()
@@ -555,8 +745,10 @@ func _reset() -> void:
 		_close_send(key)
 	_fetches.clear()
 	_held.clear()
+	_abandoned.clear()
 	_reported = {}
 	_present_key = ""
+	_paused = false
 
 
 func _packet(kind: int, raw_hash: PackedByteArray, offset: int) -> PackedByteArray:
@@ -573,6 +765,18 @@ func _send_want(id: int, hash: String, offset: int) -> void:
 
 func _send_ack(id: int, hash: String, offset: int) -> void:
 	lobby.link.send(id, LocalNetLink.CHANNEL_CONTENT, _packet(KIND_ACK, hash.hex_decode(), offset), true)
+
+
+# Calls off fetching [param hash] from [param id].
+func _abandon(id: int, hash: String) -> void:
+	_abandoned["%d:%s" % [id, hash]] = true
+	_send_cancel(id, hash)
+
+
+func _send_cancel(id: int, hash: String) -> void:
+	var packet := PackedByteArray([KIND_CANCEL])
+	packet.append_array(hash.hex_decode())
+	lobby.link.send(id, LocalNetLink.CHANNEL_CONTENT, packet, true)
 
 
 func _send_nope(id: int, hash: String, reason: int) -> void:
