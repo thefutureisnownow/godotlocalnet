@@ -20,9 +20,10 @@ extends RefCounted
 ##
 ## Members are players or spectators ([member max_spectators]). Spectators have no slot
 ## (-1) and don't hold up players: they don't count towards [member max_players], the
-## two players [method can_start] needs or [method suggested_delay], and need no ready flag
-## or content. Only their clock sync, and their loading with [member wait_for_loading],
-## are waited for, so they can follow the match from its first tick.
+## two players [method can_start] needs or [method suggested_delay], and need no ready flag.
+## Only their clock sync, and with [member wait_for_loading] their loading and so the content
+## they load, are waited for, so they can follow the match from its first tick. A spectator
+## whose connection has dropped isn't waited for.
 ## A host can also stay out of the match itself ([code]host_plays[/code] in [method host]),
 ## as a PC driving a big screen while phones play: its member is then a spectator too.
 ## Roles are a lobby matter only; how a game keeps its spectators' state up to date is its
@@ -113,7 +114,8 @@ var reconnect_window_msec := 30_000:
 			_broadcast_members()
 ## When true, [method start] first sends everyone [signal preparing] and waits until
 ## every member calls [method mark_loaded]. Spectators whose connection has dropped
-## aren't waited for.
+## aren't waited for. Since connected spectators are, [method can_start] then waits for
+## their content too.
 var wait_for_loading := false
 ## Content the match needs, as [LocalNetContent] items: the host sets it with
 ## [method LocalNetContent.require] and every member hears it with the member list.
@@ -265,22 +267,34 @@ func set_config(values: Dictionary) -> void:
 ## Host only: whether [method start] can go ahead: two players or more, every player
 ## connected and synced (with [param require_ready], ready too; with [param require_content],
 ## holding all the [member needed_content]). Spectators only need a synced clock, so they
-## can follow the start.
+## can follow the start, unless their connection has dropped. With
+## [member wait_for_loading] and [param require_content], connected spectators need the
+## content too: the start waits for them to load it, and transfers pause once it begins.
 func can_start(require_ready := false, require_content := false) -> bool:
 	if not is_host or state != "lobby" or players().size() < 2:
 		return false
 	for member in members.values():
+		var watching: bool = member.get("role", PLAYER) == SPECTATOR
+		if watching and not member.connected and not member.synced:
+			continue
 		if not member.synced:
 			return false
-		if member.get("role", PLAYER) == SPECTATOR:
+		if watching:
+			if wait_for_loading and member.connected and require_content and not _holds_content(member):
+				return false
 			continue
 		if not member.connected or (require_ready and not member.ready):
 			return false
-		if require_content and not needed_content.is_empty():
-			var content: Dictionary = member.get("content", {})
-			if content.get("need") != _needed_key or content.get("missing", 1) != 0:
-				return false
+		if require_content and not _holds_content(member):
+			return false
 	return true
+
+
+func _holds_content(member: Dictionary) -> bool:
+	if needed_content.is_empty():
+		return true
+	var content: Dictionary = member.get("content", {})
+	return content.get("need") == _needed_key and content.get("missing", 1) == 0
 
 
 ## Host only: numbers the players' slots in join order, then starts everyone at the same
@@ -475,7 +489,12 @@ func _on_peer_interrupted(id: int) -> void:
 	elif members.has(id):
 		members[id].connected = false
 		member_interrupted.emit(id)
-		_broadcast_members()
+		if state == "preparing":
+			# A spectator that drops isn't waited for, and may have been the last to load.
+			# This shares the member list either way.
+			_start_when_loaded()
+		else:
+			_broadcast_members()
 
 
 func _on_peer_resumed(id: int) -> void:
