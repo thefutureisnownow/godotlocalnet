@@ -20,15 +20,25 @@ extends RefCounted
 ## ([method timing_peers]), and since only players have slots, nobody waits on them. A
 ## spectator that falls more than [member LocalNetLockstep.keep_ticks] behind would keep
 ## the host from freeing old inputs, so the host stops holding inputs for it and emits
-## [signal spectator_dropped]. A host that doesn't play also has slot -1; it relays as usual.
+## [signal spectator_dropped]. It also tells the spectator, once and again if it reconnects,
+## so the spectator's own input sync emits [signal dropped] rather than waiting for inputs
+## that will never come. What happens next is the game's choice: the spectator can leave,
+## or stay in the lobby and watch the next match. A host that doesn't play also has slot
+## -1; it relays as usual.
 
 signal remote_input(slot: int, tick: int, arrived_usec: int)
 signal desynced(tick: int, peer_id: int)
 ## Host only: spectator [param peer_id] fell too far behind and no longer gets inputs.
 signal spectator_dropped(peer_id: int)
+## Spectating guest only: the host stopped sending this device inputs, since it fell more
+## than [member LocalNetLockstep.keep_ticks] behind. It can't follow this match any further;
+## the game decides what to do, such as leaving, or waiting in the lobby for the next match.
+signal dropped
 
 const KIND_INPUTS := 10
 const KIND_CHECKSUM := 11
+## Host to a spectator it dropped: [code][0C][/code], on the reliable events channel.
+const KIND_DROPPED := 12
 const MAX_RUN := 32
 ## Recent readings of how far ahead of a peer this device was, per peer.
 const ADVANTAGE_SAMPLES := 9
@@ -61,6 +71,7 @@ var _remote_checksums := {}
 var _advantage := {}
 var _their_readings := {}
 var _dropped := {}
+var _was_dropped := false
 
 
 ## [param peer_slots] maps each link peer to the slot it sends: see [method LocalNetLobby.peer_slots].
@@ -88,11 +99,14 @@ func _init(net_link: LocalNetLink, slots: int, own_slot: int, peer_slots: Dictio
 		_heard[id] = false
 		_advantage[id] = PackedInt32Array()
 	link.received.connect(_on_received)
+	link.peer_resumed.connect(_on_peer_resumed)
 
 
 func close() -> void:
 	if link.received.is_connected(_on_received):
 		link.received.disconnect(_on_received)
+	if link.peer_resumed.is_connected(_on_peer_resumed):
+		link.peer_resumed.disconnect(_on_peer_resumed)
 
 
 ## The next tick that needs local input; -1 on a device with no slot.
@@ -229,6 +243,7 @@ func discard_before(tick: int) -> void:
 			if _peer_slots[id] < 0 and not _dropped.has(id) and Array(_acks[id]).any(func(ack): return ack + 1 < tick):
 				_dropped[id] = true
 				spectator_dropped.emit(id)
+				_tell_dropped(id)
 	var lowest := tick
 	for slot in slot_count:
 		var limit := tick
@@ -258,6 +273,18 @@ func report_checksum(tick: int, value: int) -> void:
 	for id in _peer_slots:
 		link.send(id, LocalNetLink.CHANNEL_EVENTS, packet, true)
 	_compare(tick)
+
+
+# Lets a dropped spectator know. Reliable, but lost if its connection is down, so it's
+# sent again when it reconnects.
+func _tell_dropped(id: int) -> void:
+	link.send(id, LocalNetLink.CHANNEL_EVENTS, PackedByteArray([KIND_DROPPED]), true)
+	link.flush()
+
+
+func _on_peer_resumed(id: int) -> void:
+	if link.is_host and _dropped.has(id):
+		_tell_dropped(id)
 
 
 func _should_send(id: int, slot: int) -> bool:
@@ -309,6 +336,9 @@ func _on_received(id: int, channel: int, bytes: PackedByteArray) -> void:
 		var tick := bytes.decode_u32(1)
 		_remote_checksums.get_or_add(tick, {})[id] = bytes.decode_u32(5)
 		_compare(tick)
+	elif channel == LocalNetLink.CHANNEL_EVENTS and bytes[0] == KIND_DROPPED and bytes.size() == 1 and is_spectating() and not _was_dropped:
+		_was_dropped = true
+		dropped.emit()
 
 
 func _read_inputs(id: int, bytes: PackedByteArray) -> void:
