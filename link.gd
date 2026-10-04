@@ -1,14 +1,23 @@
 class_name LocalNetLink
 extends RefCounted
-## A thin wrapper over ENet: one host, any number of clients, four channels, and
+## A thin wrapper over ENet: one host, any number of clients, six channels, and
 ## connections that survive a drop.
 ##
 ## Channels: [constant CHANNEL_CONTROL] carries reliable lobby messages,
 ## [constant CHANNEL_REALTIME] unreliable per-frame traffic (inputs, clock pings),
 ## [constant CHANNEL_EVENTS] reliable binary events (checksums) and
-## [constant CHANNEL_CONTENT] reliable content transfers ([LocalNetContent]). Binary packets start with
-## a kind byte so several listeners can share a channel. The host is always peer
-## [constant HOST_ID]; clients are numbered from 2 on the host.
+## [constant CHANNEL_CONTENT] reliable content transfers ([LocalNetContent]). Binary packets
+## start with a kind byte so several listeners can share a channel; LocalNet keeps kinds
+## below 0x40 for itself, and games may use 0x40 to 0xFF on channels 1 and 2.
+## [constant CHANNEL_GAME_RELIABLE] and [constant CHANNEL_GAME_REALTIME] are the game's
+## own: LocalNet never sends or reads anything on them. Separate channels keep ordering and
+## kind bytes apart, but not bandwidth: ENet's reliable window is shared by all of a peer's
+## channels, so a game sending bulky reliable data should limit how much it has in flight,
+## as [LocalNetContent] does, or it holds up lobby messages and checksums. Unreliable
+## packets are sequenced per channel: one that arrives after a newer one on the same
+## channel is dropped, so a game's own real-time traffic belongs on
+## [constant CHANNEL_GAME_REALTIME] rather than among the inputs on channel 1. The host is
+## always peer [constant HOST_ID]; clients are numbered from 2 on the host.
 ##
 ## Reconnecting: each client sends a random token with its connection request. When a
 ## connection drops without a goodbye, both sides emit [signal peer_interrupted]; the
@@ -34,7 +43,7 @@ signal received(id: int, channel: int, bytes: PackedByteArray)
 ## The first connection attempt failed.
 signal connect_failed
 
-enum { CHANNEL_CONTROL, CHANNEL_REALTIME, CHANNEL_EVENTS, CHANNEL_CONTENT, CHANNEL_COUNT }
+enum { CHANNEL_CONTROL, CHANNEL_REALTIME, CHANNEL_EVENTS, CHANNEL_CONTENT, CHANNEL_GAME_RELIABLE, CHANNEL_GAME_REALTIME, CHANNEL_COUNT }
 const HOST_ID := 1
 ## Codes sent with a disconnect, so the other side knows it was deliberate.
 enum { BYE_NONE, BYE_LEAVE, BYE_KICK, BYE_FORGOTTEN }

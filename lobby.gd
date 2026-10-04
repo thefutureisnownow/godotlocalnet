@@ -540,7 +540,9 @@ func _on_received(id: int, channel: int, bytes: PackedByteArray) -> void:
 			else:
 				_client_message(message)
 	elif channel == LocalNetLink.CHANNEL_REALTIME and bytes.size() > 0:
-		if bytes[0] == KIND_PING and is_host and bytes.size() >= 9:
+		# Games may share this channel with their own kinds, so only a ping or pong of
+		# exactly the right size counts: from a member to the host, or from the host.
+		if bytes[0] == KIND_PING and bytes.size() == 9 and is_host and members.has(id):
 			var pong := PackedByteArray([KIND_PONG])
 			pong.resize(21)
 			pong.encode_s64(1, bytes.decode_s64(1))
@@ -548,9 +550,8 @@ func _on_received(id: int, channel: int, bytes: PackedByteArray) -> void:
 			pong.encode_u32(17, mini(_frame_gap_usec, 0xFFFFFFFF))
 			link.send(id, LocalNetLink.CHANNEL_REALTIME, pong, false)
 			link.flush()
-		elif bytes[0] == KIND_PONG and not is_host and bytes.size() >= 17:
-			var host_gap: int = bytes.decode_u32(17) if bytes.size() >= 21 else 0
-			_clock_sample(bytes.decode_s64(1), bytes.decode_s64(9), Time.get_ticks_usec(), maxi(host_gap, _frame_gap_usec) > HITCH_USEC)
+		elif bytes[0] == KIND_PONG and bytes.size() == 21 and not is_host and id == LocalNetLink.HOST_ID:
+			_clock_sample(bytes.decode_s64(1), bytes.decode_s64(9), Time.get_ticks_usec(), maxi(bytes.decode_u32(17), _frame_gap_usec) > HITCH_USEC)
 
 
 func _host_message(id: int, message: Dictionary) -> void:
