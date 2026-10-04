@@ -70,6 +70,7 @@ func run() -> void:
 	content_items()
 	spectator_drops_loading()
 	spectator_content_loading()
+	game_channels()
 	print("LOCALNET: %d checks, %d failures" % [checks, failures.size()])
 	for failure in failures:
 		print("  FAIL ", failure)
@@ -1891,4 +1892,63 @@ func spectator_content_loading() -> void:
 	for c in [hc, gc, wc]:
 		c.close()
 	for l in [host, guest, watcher]:
+		l.leave()
+
+
+# Channels 4 and 5 are the game's own, and LocalNet's pings only answer to themselves.
+func game_channels() -> void:
+	check(LocalNetLink.CHANNEL_GAME_RELIABLE == 4 and LocalNetLink.CHANNEL_GAME_REALTIME == 5 and LocalNetLink.CHANNEL_COUNT == 6, "Two channels are kept for games")
+	var pair := joined_pair()
+	var host: LocalNetLobby = pair[0]
+	var guest: LocalNetLobby = pair[1]
+	var hc := content_for(host, "channels-host")
+	var bytes := blob(50_000)
+	var item := LocalNetContent.describe("stage", "reef", bytes)
+	hc.offer(item, bytes)
+	const MARK := 123_456_789
+	var heard := []
+	var marked := [0]
+	host.link.received.connect(func(_id, channel, b):
+		if channel >= LocalNetLink.CHANNEL_GAME_RELIABLE:
+			heard.append([channel, b.size()]))
+	guest.link.received.connect(func(_id, channel, b):
+		if channel >= LocalNetLink.CHANNEL_GAME_RELIABLE:
+			heard.append([channel, b.size()])
+		elif channel == LocalNetLink.CHANNEL_REALTIME and b.size() == 21 and b[0] == LocalNetLobby.KIND_PONG and b.decode_s64(1) == MARK:
+			marked[0] += 1)
+	var ping := PackedByteArray([LocalNetLobby.KIND_PING])
+	ping.resize(9)
+	ping.encode_s64(1, MARK)
+	var want := hc._packet(LocalNetContent.KIND_WANT, item.hash.hex_decode(), 0)
+	for channel in [LocalNetLink.CHANNEL_GAME_RELIABLE, LocalNetLink.CHANNEL_GAME_REALTIME]:
+		guest.link.send(1, channel, ping, channel == LocalNetLink.CHANNEL_GAME_RELIABLE)
+		guest.link.send(1, channel, want, channel == LocalNetLink.CHANNEL_GAME_RELIABLE)
+		host.link.send(guest.local_id, channel, ping, channel == LocalNetLink.CHANNEL_GAME_RELIABLE)
+	var longer := ping.duplicate()
+	longer.append(0)
+	guest.link.send(1, LocalNetLink.CHANNEL_REALTIME, longer, false)
+	guest.link.flush()
+	host.link.flush()
+	pump(pair + [hc], 1.0, func(): return heard.size() == 6)
+	check(heard.size() == 6, "Game packets on channels 4 and 5 go both ways: %s" % [heard])
+	check(marked[0] == 0 and hc._sends.is_empty(), "LocalNet reads nothing on them, and a ping with a byte too many isn't one")
+	guest.link.send(1, LocalNetLink.CHANNEL_REALTIME, ping, false)
+	guest.link.flush()
+	pump(pair + [hc], 1.0, func(): return marked[0] > 0)
+	check(marked[0] == 1, "...while a real ping is answered")
+	# A guest only takes pongs of the right size, from the host.
+	var pong := PackedByteArray([LocalNetLobby.KIND_PONG])
+	pong.resize(21)
+	pong.encode_s64(9, Time.get_ticks_usec())
+	var fake := func(from: int, channel: int, size: int) -> bool:
+		guest._samples.clear()
+		var packet := pong.duplicate()
+		packet.encode_s64(1, Time.get_ticks_usec() - 1)
+		packet.resize(size)
+		guest._on_received(from, channel, packet)
+		return not guest._samples.is_empty()
+	check(not fake.call(1, LocalNetLink.CHANNEL_REALTIME, 17) and not fake.call(1, LocalNetLink.CHANNEL_REALTIME, 22) and not fake.call(3, LocalNetLink.CHANNEL_REALTIME, 21) and not fake.call(1, LocalNetLink.CHANNEL_GAME_REALTIME, 21), "A guest ignores pongs of the wrong size, from others or on game channels")
+	check(fake.call(1, LocalNetLink.CHANNEL_REALTIME, 21), "...and takes a real one")
+	hc.close()
+	for l in pair:
 		l.leave()

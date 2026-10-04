@@ -17,14 +17,14 @@ git subtree pull --prefix=addons/localnet https://github.com/stained/godotlocaln
 
 Change LocalNet here, never in a game's copy. After the tests pass, bump `addons/localnet/VERSION`, commit, and run `tools/publish_addon.sh` to update the `addon` branch.
 
-**Updating a game to 0.3:** bump the game's own protocol version (the `version` it gives `LocalNetDiscovery` and `LocalNetLobby`, such as Snoek'em's `PROTOCOL`), even if no game code changes. 0.3 adds a fourth ENet channel, and its lobby `hello` carries LocalNet's own wire version (`"ln": 3`). A 0.3 host turns away a guest without it, or with another one, as "Different LocalNet version", but a 0.2 host ignores it and would let a 0.3 guest in. Bumping the game's version keeps old and new builds apart on both sides, and discovery lists the other build as incompatible.
+**Updating a game to 0.3:** bump the game's own protocol version (the `version` it gives `LocalNetDiscovery` and `LocalNetLobby`, such as Snoek'em's `PROTOCOL`), even if no game code changes. 0.3 adds three ENet channels (content, and two for the game's own use), and its lobby `hello` carries LocalNet's own wire version (`"ln": 3`). A 0.3 host turns away a guest without it, or with another one, as "Different LocalNet version", but a 0.2 host ignores it and would let a 0.3 guest in. Bumping the game's version keeps old and new builds apart on both sides, and discovery lists the other build as incompatible.
 
 ## The addon
 
 | Class | Job |
 |---|---|
 | `LocalNetDiscovery` | Hosts answer UDP probes on port 47650, or the first free of 47651–47653 when another host on the same device has it. Scanners probe every address in each local IPv4 /24, plus broadcast where allowed, and list the hosts that reply. A scan can also target one typed address, which finds its game port. |
-| `LocalNetLink` | A thin ENet wrapper with one host, any number of clients and four channels: reliable control, unreliable real-time, reliable events and reliable content. The game port is chosen by the system or by the host. Dropped connections reconnect under the same id (see below). It can simulate loss, latency, jitter, hiccups and dropped connections for tests. |
+| `LocalNetLink` | A thin ENet wrapper with one host, any number of clients and six channels: reliable control, unreliable real-time, reliable events and reliable content, plus a reliable and an unreliable channel of the game's own. The game port is chosen by the system or by the host. Dropped connections reconnect under the same id (see below). It can simulate loss, latency, jitter, hiccups and dropped connections for tests. |
 | `LocalNetLobby` | Join, reject (wrong game, version or code, or a full lobby), the member list, players and spectators, per-player data, shared settings, ready flags, clock sync, link quality and `suggested_delay()`. It can wait until everyone has loaded before a synchronized start, and returns to the lobby for rematches. The host can also stay out of the match and only relay (see below). |
 | `LocalNetInputSync` | Lockstep input exchange with input delay. Packets resend everything that hasn't been acknowledged, so losses cost nothing. The host relays when there are more than two players, and to spectators. It also offers checksum desync detection, and `predicted_inputs()` as the first building block for rollback. |
 | `LocalNetLockstep` | The per-frame loop: which ticks are due, sampling input ahead, stepping, checksums and freeing old inputs. After a stall it moves its schedule back instead of racing through the backlog, and it reports who it's waiting on. Time sync keeps devices' schedules together after hiccups or a misjudged clock offset (see below). |
@@ -55,6 +55,25 @@ lobby.started.connect(func(config, start_usec):
 ```
 
 ## Wire protocol
+
+### Channels and kind bytes
+
+The link has six ENet channels. LocalNet's binary packets start with a kind byte, so a game can share channels 1 and 2 with its own packets, using kinds 0x40 to 0xFF. LocalNet keeps everything below 0x40 on its channels for itself, and never sends or reads anything on channels 4 and 5, which are the game's own.
+
+| Channel | Mode | LocalNet sends | A game may send |
+|---|---|---|---|
+| 0 `CHANNEL_CONTROL` | reliable | Lobby messages only: `var_to_bytes` dictionaries, no kind byte | Nothing |
+| 1 `CHANNEL_REALTIME` | unreliable | PING `01`, PONG `02`, INPUTS `0A` | Kinds `40`–`FF` |
+| 2 `CHANNEL_EVENTS` | reliable | CHECKSUM `0B` | Kinds `40`–`FF` |
+| 3 `CHANNEL_CONTENT` | reliable | WANT `14`, CHUNK `15`, ACK `16`, NOPE `17`, CANCEL `18`; `19`–`3F` kept for later | Nothing |
+| 4 `CHANNEL_GAME_RELIABLE` | reliable | Nothing | Anything |
+| 5 `CHANNEL_GAME_REALTIME` | unreliable | Nothing | Anything |
+
+Separate channels keep ordering and kind bytes apart, but not bandwidth. ENet's reliable window is per peer, shared by all its channels, so a game sending bulky reliable data on `CHANNEL_GAME_RELIABLE` should limit how much it has in flight, the way `LocalNetContent` does, or it delays LocalNet's lobby messages and checksums behind it. Unreliable packets use ENet's default sequenced mode: on any one channel, an older packet that arrives after a newer one is dropped. A game's own real-time traffic interleaved with inputs on channel 1 would get inputs dropped that way, and inputs dropped by it, so it belongs on `CHANNEL_GAME_REALTIME`.
+
+The lobby only takes a PING of exactly 9 bytes from a member, and a PONG of exactly 21 bytes from the host, so a game packet on channel 1 can't be mistaken for one even if it reuses a kind.
+
+### Messages
 
 Discovery is JSON over UDP, so it stays readable and language-neutral:
 
@@ -347,6 +366,7 @@ godot --headless --path . --script tests/test_demo.gd       # 41 checks, about 2
   - the host changing what's needed mid-transfer, in both directions, with the old transfer called off and the window kept;
   - repeated WANTs, WANTs past the end, and transfers that go quiet at either end;
   - a new session starting with no transfers left from the last.
+- **Channels:** the game's own channels 4 and 5 carrying packets both ways while LocalNet ignores them, and pings and pongs of the wrong size or from the wrong peer ignored.
 - **Other:** desync detection, players leaving, and the statistics maths.
 
 `test_demo.gd` launches the link test app as separate host and guest processes and reads the results they save:
