@@ -19,13 +19,18 @@ extends RefCounted
 ## stop waiting early with [method give_up].
 ##
 ## Members are players or spectators ([member max_spectators]). Spectators have no slot
-## (-1) and don't hold up players: they don't count towards [member max_players], the
-## two players [method can_start] needs or [method suggested_delay], and need no ready flag.
-## Only their clock sync, and with [member wait_for_loading] their loading and so the content
-## they load, are waited for, so they can follow the match from its first tick. A spectator
-## whose connection has dropped isn't waited for.
+## (-1) and never hold anything up: they don't count towards [member max_players], the
+## two players [method can_start] needs or [method suggested_delay], and [method can_start]
+## doesn't wait for their clock sync, ready flag or content. With [member wait_for_loading],
+## the start waits for their loading only [member spectator_load_wait_msec] after the players
+## have loaded; one that loads later still joins the match on the same clock, and catches up
+## or is dropped ([signal LocalNetInputSync.dropped]). [signal member_interrupted],
+## [signal member_resumed] and [signal member_left] fire for spectators too, so check
+## [method is_spectator] before acting on them.
 ## A host can also stay out of the match itself ([code]host_plays[/code] in [method host]),
-## as a PC driving a big screen while phones play: its member is then a spectator too.
+## as a PC driving a big screen while phones play: its member is then a spectator too. It's
+## still the hub everyone's connected through, so it's waited for like a player: its loading
+## and, with [code]require_content[/code], its content.
 ## Roles are a lobby matter only; how a game keeps its spectators' state up to date is its
 ## own business ([LocalNetInputSync] relays inputs to them for lockstep games).
 ##
@@ -119,10 +124,14 @@ var reconnect_window_msec := 30_000:
 		if is_host and state != "idle":
 			_broadcast_members()
 ## When true, [method start] first sends everyone [signal preparing] and waits until
-## every member calls [method mark_loaded]. Spectators whose connection has dropped
-## aren't waited for. Since connected spectators are, [method can_start] then waits for
-## their content too.
+## every player, and the host, calls [method mark_loaded]. Spectators are waited for only
+## up to [member spectator_load_wait_msec] more, and not at all once their connection drops.
 var wait_for_loading := false
+## With [member wait_for_loading]: how long the start waits for spectators still loading,
+## from the moment every player has loaded. 0 doesn't wait for them at all. A spectator
+## that loads later gets [signal started] once it has loaded, with the match's own start
+## time, and catches up from there (or is dropped when too far behind).
+var spectator_load_wait_msec := 3000
 ## Content the match needs, as [LocalNetContent] items: the host sets it with
 ## [method LocalNetContent.require] and every member hears it with the member list.
 var needed_content := []
@@ -145,6 +154,12 @@ var _frame_gap_usec := 0
 var _frames := PackedInt32Array()
 var _next_host_report_usec := 0
 var _start_at := 0
+# Host: when every player had loaded, while spectators still load (0: not yet).
+var _players_loaded_usec := 0
+# Guest: whether it has loaded since the last prepare, and a start that came first.
+var _loaded := false
+var _start_held := false
+var _held_start_at := 0
 var _role := PLAYER
 var _needed_key := ""
 # Counts the sessions this lobby has opened with [method host] or [method join], so
@@ -198,6 +213,8 @@ func join(address: String, port: int, player_name: String, join_code := "", role
 	_session += 1
 	_name = player_name
 	_role = SPECTATOR if role == SPECTATOR else PLAYER
+	_loaded = false
+	_start_held = false
 	needed_content = []
 	_needed_key = ""
 	_join_code_hash = _hash_code(join_code)
@@ -231,6 +248,9 @@ func poll() -> void:
 			ping.resize(9)
 			ping.encode_s64(1, now)
 			link.send(LocalNetLink.HOST_ID, LocalNetLink.CHANNEL_REALTIME, ping, false)
+	if is_host and state == "preparing" and _players_loaded_usec > 0 and Time.get_ticks_usec() - _players_loaded_usec >= spectator_load_wait_msec * 1000:
+		# Spectators still loading have had long enough.
+		_go()
 	link.flush()
 
 
@@ -272,24 +292,18 @@ func set_config(values: Dictionary) -> void:
 
 ## Host only: whether [method start] can go ahead: two players or more, every player
 ## connected and synced (with [param require_ready], ready too; with [param require_content],
-## holding all the [member needed_content]). Spectators only need a synced clock, so they
-## can follow the start, unless their connection has dropped. With
-## [member wait_for_loading] and [param require_content], connected spectators need the
-## content too: the start waits for them to load it, and transfers pause once it begins.
+## holding all the [member needed_content], as must the host itself). Spectators are never
+## waited for: one whose clock isn't synced yet still gets the start, and its lag behind the
+## schedule absorbs a rough clock. One without the content just won't load in time.
 func can_start(require_ready := false, require_content := false) -> bool:
 	if not is_host or state != "lobby" or players().size() < 2:
 		return false
-	for member in members.values():
-		var watching: bool = member.get("role", PLAYER) == SPECTATOR
-		if watching and not member.connected and not member.synced:
+	for id in members:
+		var member: Dictionary = members[id]
+		var playing: bool = member.get("role", PLAYER) == PLAYER
+		if not playing and id != local_id:
 			continue
-		if not member.synced:
-			return false
-		if watching:
-			if wait_for_loading and member.connected and require_content and not _holds_content(member):
-				return false
-			continue
-		if not member.connected or (require_ready and not member.ready):
+		if not member.synced or not member.connected or (playing and require_ready and not member.ready):
 			return false
 		if require_content and not _holds_content(member):
 			return false
@@ -313,6 +327,7 @@ func start() -> void:
 		members[ids[i]].slot = i
 	for id in members:
 		members[id].loaded = false
+	_players_loaded_usec = 0
 	if not wait_for_loading:
 		_go()
 		return
@@ -337,8 +352,14 @@ func mark_loaded() -> void:
 		members[local_id].loaded = true
 		_start_when_loaded()
 	else:
+		_loaded = true
 		_send(LocalNetLink.HOST_ID, {"t": "member", "loaded": true})
 		link.flush()
+		if _start_held:
+			# The match started while this spectator was still loading.
+			_start_held = false
+			state = "started"
+			started.emit(config, host_to_local_usec(_held_start_at))
 
 
 ## Host only: ends the match and brings everyone back for a rematch. Ready flags reset.
@@ -346,6 +367,7 @@ func return_to_lobby() -> void:
 	if not is_host or state not in ["preparing", "started"]:
 		return
 	state = "lobby"
+	_players_loaded_usec = 0
 	for member in members.values():
 		member.ready = false
 		member.loaded = false
@@ -466,6 +488,7 @@ func _update_self(values: Dictionary) -> void:
 
 func _go() -> void:
 	state = "started"
+	_players_loaded_usec = 0
 	_broadcast_members()
 	_start_at = Time.get_ticks_usec() + START_DELAY_USEC
 	_send_all({"t": "start", "config": config, "start_at": _start_at})
@@ -473,11 +496,24 @@ func _go() -> void:
 	started.emit(config, _start_at)
 
 
+# Starts once every player, and the host, has loaded, and the spectators have too or have
+# had [member spectator_load_wait_msec] longer ([method poll] keeps time).
 func _start_when_loaded() -> void:
 	if state != "preparing":
 		return
-	for member in members.values():
-		if not member.loaded and (member.connected or member.get("role", PLAYER) == PLAYER):
+	var watchers_loading := false
+	for id in members:
+		var member: Dictionary = members[id]
+		if member.loaded:
+			continue
+		if member.get("role", PLAYER) == PLAYER or id == local_id:
+			_broadcast_members()
+			return
+		watchers_loading = watchers_loading or member.connected
+	if watchers_loading and spectator_load_wait_msec > 0:
+		if _players_loaded_usec == 0:
+			_players_loaded_usec = Time.get_ticks_usec()
+		if Time.get_ticks_usec() - _players_loaded_usec < spectator_load_wait_msec * 1000:
 			_broadcast_members()
 			return
 	_go()
@@ -635,25 +671,43 @@ func _client_message(message: Dictionary) -> void:
 		"resume":
 			config = message.config
 			if message.state == "started" and state != "started":
-				state = "started"
-				started.emit(config, host_to_local_usec(message.start_at))
+				_begin(message.start_at)
 			elif message.state == "preparing" and state != "preparing":
-				state = "preparing"
-				preparing.emit(config)
+				_prepare()
 			elif message.state == "lobby" and state in ["preparing", "started"]:
-				state = "lobby"
-				returned.emit()
+				_return()
 		"prepare":
 			config = message.config
-			state = "preparing"
-			preparing.emit(config)
+			_prepare()
 		"start":
 			config = message.config
-			state = "started"
-			started.emit(config, host_to_local_usec(message.start_at))
+			_begin(message.start_at)
 		"return":
-			state = "lobby"
-			returned.emit()
+			_return()
+
+
+func _prepare() -> void:
+	state = "preparing"
+	_loaded = false
+	_start_held = false
+	preparing.emit(config)
+
+
+# A guest starts on the match's clock. One still loading (only a spectator can be: the
+# host waits for players) starts when it calls [method mark_loaded].
+func _begin(start_at: int) -> void:
+	if state == "preparing" and not _loaded:
+		_start_held = true
+		_held_start_at = start_at
+		return
+	state = "started"
+	started.emit(config, host_to_local_usec(start_at))
+
+
+func _return() -> void:
+	state = "lobby"
+	_start_held = false
+	returned.emit()
 
 
 func _clock_sample(sent: int, host_time: int, now: int, hitched := false) -> void:
