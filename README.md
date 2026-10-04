@@ -172,7 +172,7 @@ Every member has a role in the lobby, `"player"` or `"spectator"`. Roles are a l
 | `players()`, `spectators()`, `is_spectator(id)` | Member ids by role, and whether a member watches. A host that doesn't play is among the spectators. |
 | `advert()` | `players` counts players only; `spectators` and `max_spectators` are new, and discovery's sessions carry them. |
 
-Spectators have slot −1 and don't hold up players. They don't count towards `max_players`, the two players `can_start()` needs, `start()`'s slot numbering or `suggested_delay()`. They need no ready flag and no content (they can't follow a match without it, but the players needn't wait). Two things still wait for a spectator, both in the lobby and never mid-match: `can_start()` waits for its clock to be synced (about 1.5 s after joining; without it, its start time would be a guess), and with `wait_for_loading` the start waits for it to load, so it can follow from the first tick, unless its connection has dropped.
+Spectators have slot −1 and don't hold up players. They don't count towards `max_players`, the two players `can_start()` needs, `start()`'s slot numbering or `suggested_delay()`. They need no ready flag. Without `wait_for_loading` they need no content either (they can't follow a match without it, but the players needn't wait). A few things still wait for a spectator, all in the lobby and never mid-match: `can_start()` waits for its clock to be synced (about 1.5 s after joining; without it, its start time would be a guess), and with `wait_for_loading` the start waits for it to load, so it can follow from the first tick. Since transfers pause once a match is preparing, `can_start(..., true)` then waits for connected spectators' content as well, or a spectator still downloading would hold up the start for good. None of this waits for a spectator whose connection has dropped: one that drops while it's the last to load lets the match start, and one that dropped before its clock was synced doesn't block `can_start()`. Players are waited for as before.
 
 A navigator or co-driver isn't a role. Anything that changes the game has to reach every device, so in lockstep a co-driver is just another player slot whose input means something else; the game says so in member data.
 
@@ -328,6 +328,8 @@ godot --headless --path . --script tests/test_demo.gd       # 41 checks, about 2
   - a lockstep match surviving an 800 ms drop with identical inputs on both sides.
 - **Spectators and roles:**
   - spectators turned away by default and past the limit, and not taking players' places;
+  - a spectator that drops while it's the last one loading, or before its clock is synced, not holding up the start;
+  - with `wait_for_loading`, `can_start(false, true)` waiting for a spectator's content;
   - players and spectators counted apart in `can_start()`, the advert, slot numbering and the suggested delay;
   - a host that doesn't play starting two guests' lockstep match, identical inputs and checksums on all three devices, over a clean and a lossy link;
   - a spectator following a lockstep match;

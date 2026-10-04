@@ -68,6 +68,8 @@ func run() -> void:
 	content_bad_source()
 	content_rehash()
 	content_items()
+	spectator_drops_loading()
+	spectator_content_loading()
 	print("LOCALNET: %d checks, %d failures" % [checks, failures.size()])
 	for failure in failures:
 		print("  FAIL ", failure)
@@ -1799,3 +1801,94 @@ func content_items() -> void:
 	var task := WorkerThreadPool.add_task(func(): on_thread[0] = LocalNetContent.describe("mod", "big", bytes))
 	WorkerThreadPool.wait_for_task_completion(task)
 	check(on_thread[0] == LocalNetContent.describe("mod", "big", bytes), "describe() gives the same item on a worker thread")
+
+
+func spectated_lobby(players := 2) -> LocalNetLobby:
+	var host := LocalNetLobby.new(GAME, 1)
+	host.max_spectators = 1
+	host.wait_for_loading = true
+	check(host.host("Host", players) == OK, "Host opens a lobby")
+	return host
+
+
+# A spectator that drops while it's the last one loading doesn't hold up the start, and
+# one that dropped before its clock was synced doesn't block can_start().
+func spectator_drops_loading() -> void:
+	var host := spectated_lobby()
+	var guest := join_lobby(host, "Guest")
+	var watcher := join_as(host, "Watcher", "spectator")
+	var everyone := [host, guest, watcher]
+	pump(everyone, 6.0, func(): return host.can_start() and host.members.size() == 3)
+	guest.preparing.connect(func(_c): guest.mark_loaded())
+	var starts := []
+	host.started.connect(func(_c, _at): starts.append("host"))
+	watcher.started.connect(func(_c, _at): starts.append("watcher"))
+	host.start()
+	host.mark_loaded()
+	pump(everyone, 2.0, func(): return host.members[guest.local_id].loaded)
+	check(host.state == "preparing" and not host.members[watcher.local_id].loaded, "The spectator is the last one loading")
+	watcher.link.debug_drop_connection(LocalNetLink.HOST_ID, 1500)
+	pump(everyone, 1.0, func(): return host.state == "started")
+	check(host.state == "started" and not host.members[watcher.local_id].connected, "Its connection dropping lets the match start without it")
+	pump(everyone, 5.0, func(): return starts.has("watcher"))
+	check(starts.has("watcher"), "...and it joins the match on its return")
+	for l in everyone:
+		l.leave()
+	# Dropped before its clock was synced.
+	host = spectated_lobby()
+	guest = join_lobby(host, "Guest")
+	pump([host, guest], 5.0, func(): return host.can_start())
+	watcher = join_as(host, "Watcher", "spectator")
+	pump([host, guest, watcher], 3.0, func(): return host.members.size() == 3)
+	var w := watcher.local_id
+	check(host.members.has(w) and not host.members[w].synced and not host.can_start(), "A spectator still syncing its clock holds up the start")
+	watcher.link.debug_drop_connection(LocalNetLink.HOST_ID, 2500)
+	pump([host, guest, watcher], 0.5)
+	check(not host.members[w].connected and not host.members[w].synced and host.can_start(), "...but not once its connection has dropped")
+	var back := [false]
+	host.member_resumed.connect(func(id): back[0] = back[0] or (id == w and not host.can_start()))
+	pump([host, guest, watcher], 6.0, func(): return host.members[w].connected and host.members[w].synced)
+	check(back[0] and host.can_start(), "Back and still syncing it holds it up again, until it's synced")
+	guest.link.debug_drop_connection(LocalNetLink.HOST_ID, 2500)
+	pump([host, guest, watcher], 0.5)
+	check(not host.can_start(), "A player whose connection drops is still waited for")
+	for l in [host, guest, watcher]:
+		l.leave()
+
+
+# With wait_for_loading, the start waits for spectators to load, so it waits for their
+# content too: transfers pause once the match is preparing.
+func spectator_content_loading() -> void:
+	var host := spectated_lobby()
+	var guest := join_lobby(host, "Guest")
+	var watcher := join_as(host, "Watcher", "spectator")
+	pump([host, guest, watcher], 6.0, func(): return host.can_start() and host.members.size() == 3)
+	var hc := content_for(host, "loading-host")
+	var gc := content_for(guest, "loading-guest")
+	var wc := content_for(watcher, "loading-watcher")
+	hc.budget_bytes = LocalNetContent.CHUNK_BYTES
+	var bytes := blob(2 * 1024 * 1024)
+	var item := LocalNetContent.describe("track", "t", bytes)
+	hc.offer(item, bytes)
+	hc.require([item])
+	guest.preparing.connect(func(_c): guest.mark_loaded())
+	watcher.preparing.connect(func(_c): if wc.missing().is_empty(): watcher.mark_loaded())
+	var things := [host, hc, guest, gc, watcher, wc]
+	var every := [4000, 4000, 4000, 4000, 60_000, 60_000]
+	var w := watcher.local_id
+	var watcher_missing := func(): return host.members[w].get("content", {}).get("missing", 1) != 0
+	pump_frames(things, every, 10.0, func(): return host.members[guest.local_id].get("content", {}).get("missing", 1) == 0)
+	check(watcher_missing.call() and not host.can_start(false, true), "With wait_for_loading, a spectator still fetching holds up can_start(false, true)")
+	host.wait_for_loading = false
+	check(host.can_start(false, true), "...which without it ignores spectators' content, as before")
+	host.wait_for_loading = true
+	pump_frames(things, every, 15.0, func(): return host.can_start(false, true))
+	check(host.can_start(false, true) and not watcher_missing.call(), "...until it holds everything")
+	host.start()
+	host.mark_loaded()
+	pump_frames(things, every, 4.0, func(): return host.state == "started" and watcher.state == "started")
+	check(host.state == "started" and watcher.state == "started", "Then the start doesn't wait on a download that can't finish")
+	for c in [hc, gc, wc]:
+		c.close()
+	for l in [host, guest, watcher]:
+		l.leave()
