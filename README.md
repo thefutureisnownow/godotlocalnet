@@ -313,7 +313,7 @@ godot --headless --path . -- --join=127.0.0.1 --quit
 ## Tests
 
 ```sh
-godot --headless --path . --script tests/test_localnet.gd   # 307 checks, about 2½ minutes
+godot --headless --path . --script tests/test_localnet.gd   # 391 checks, about 2½ minutes
 godot --headless --path . --script tests/test_demo.gd       # 41 checks, about 2½ minutes
 ```
 
