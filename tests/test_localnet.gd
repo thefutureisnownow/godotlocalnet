@@ -71,6 +71,7 @@ func run() -> void:
 	spectator_drops_loading()
 	spectator_content_loading()
 	game_channels()
+	spectator_told_dropped()
 	print("LOCALNET: %d checks, %d failures" % [checks, failures.size()])
 	for failure in failures:
 		print("  FAIL ", failure)
@@ -1952,3 +1953,45 @@ func game_channels() -> void:
 	hc.close()
 	for l in pair:
 		l.leave()
+
+
+# A dropped spectator hears about it, even when it was away at the time and came back.
+func spectator_told_dropped() -> void:
+	var host_link := AddressedLink.new()
+	host_link.is_host = true
+	var host := LocalNetInputSync.new(host_link, 2, 0, {2: 1, 3: -1}, 2, 1)
+	var guest := LocalNetInputSync.new(AddressedLink.new(), 2, 1, {1: -1}, 2, 1)
+	var watcher := LocalNetInputSync.new(AddressedLink.new(), 2, -1, {1: -1}, 2, 1)
+	var told := []
+	watcher.dropped.connect(func(): told.append("watcher"))
+	guest.dropped.connect(func(): told.append("guest"))
+	for t in range(2, 300):
+		host.add_local_input(t, PackedByteArray([1]))
+		guest.add_local_input(t, PackedByteArray([2]))
+		if t % 10 == 0:
+			host.flush()
+			guest.flush()
+			for packet in host_link.outbox:
+				if packet[0] == 2:
+					guest._on_received(1, packet[1], packet[2])
+			for packet in guest.link.outbox:
+				host._on_received(2, packet[1], packet[2])
+			host_link.outbox.clear()
+			guest.link.outbox.clear()
+	var markers := func() -> Array:
+		return host_link.outbox.filter(func(p): return p[1] == LocalNetLink.CHANNEL_EVENTS and p[2] == PackedByteArray([LocalNetInputSync.KIND_DROPPED]))
+	host.discard_before(250)
+	host.discard_before(260)
+	check(host.is_dropped(3) and markers.call().size() == 1 and markers.call()[0][0] == 3, "The host tells a spectator it drops, once")
+	# It was away, so that was lost; it comes back within the window.
+	host_link.outbox.clear()
+	host_link.peer_resumed.emit(2)
+	check(markers.call().is_empty(), "...not players who reconnect")
+	host_link.peer_resumed.emit(3)
+	check(markers.call().size() == 1 and markers.call()[0][0] == 3, "...and again when the spectator reconnects")
+	for packet in markers.call() + markers.call():
+		watcher._on_received(1, packet[1], packet[2])
+		guest._on_received(1, packet[1], packet[2])
+	check(told == ["watcher"], "The spectator's own input sync says it was dropped, once, and a player's ignores it: %s" % [told])
+	for s in [host, guest, watcher]:
+		s.close()

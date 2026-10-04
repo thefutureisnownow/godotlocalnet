@@ -64,7 +64,7 @@ The link has six ENet channels. LocalNet's binary packets start with a kind byte
 |---|---|---|---|
 | 0 `CHANNEL_CONTROL` | reliable | Lobby messages only: `var_to_bytes` dictionaries, no kind byte | Nothing |
 | 1 `CHANNEL_REALTIME` | unreliable | PING `01`, PONG `02`, INPUTS `0A` | Kinds `40`–`FF` |
-| 2 `CHANNEL_EVENTS` | reliable | CHECKSUM `0B` | Kinds `40`–`FF` |
+| 2 `CHANNEL_EVENTS` | reliable | CHECKSUM `0B`, DROPPED `0C` | Kinds `40`–`FF` |
 | 3 `CHANNEL_CONTENT` | reliable | WANT `14`, CHUNK `15`, ACK `16`, NOPE `17`, CANCEL `18`; `19`–`3F` kept for later | Nothing |
 | 4 `CHANNEL_GAME_RELIABLE` | reliable | Nothing | Anything |
 | 5 `CHANNEL_GAME_REALTIME` | unreliable | Nothing | Anything |
@@ -97,6 +97,7 @@ Match traffic is binary and little-endian. The first byte of every packet is a k
 PING      ch1 unreliable  [01][t0: i64]                        9 bytes
 PONG      ch1 unreliable  [02][t0: i64][host_now: i64][host_frame: u32]   21 bytes
 CHECKSUM  ch2 reliable    [0B][tick: u32][hash: u32]           9 bytes
+DROPPED   ch2 reliable    [0C]                                 1 byte    host → a spectator it stopped sending inputs to
 
 INPUTS    ch1 unreliable
   [0A][slot_count: u8]
@@ -200,7 +201,7 @@ A navigator or co-driver isn't a role. Anything that changes the game has to rea
 - The host's `peer_slots()` maps spectators to −1, and `LocalNetInputSync` relays every slot to them the way it relays to players. A device with no slot (a spectator, or a host that doesn't play) passes `own_slot = -1` and never samples input.
 - Spectators never slow players. The host leaves them out of time sync (`timing_peers()`), and `waiting_on()` only names slots, which spectators don't have.
 - A spectating guest hears every input second-hand, so its runner stays `spectator_lag_ticks` (4) behind the shared schedule to ride out the extra hop. After a stall it eases back in like everyone else, then catches up, running at most `catch_up_rate` (25%) faster and only as far as the inputs it holds allow. A host that doesn't play hears every input first-hand and runs on the schedule.
-- The host keeps inputs until every peer has confirmed them. A spectator that falls more than `keep_ticks` (240) behind would keep them forever, so the host stops sending to it and emits `spectator_dropped(id)`. What happens next is the game's choice.
+- The host keeps inputs until every peer has confirmed them. A spectator that falls more than `keep_ticks` (240) behind would keep them forever, so the host stops sending to it and emits `spectator_dropped(id)`. It tells the spectator too, with one DROPPED packet, sent again if the spectator reconnects within the window, so the spectator's own `LocalNetInputSync` emits `dropped` instead of waiting for inputs that will never come. What happens next is the game's choice: the spectator can leave, or stay in the lobby and watch the next match.
 - Spectators report checksums like anyone else, and a mismatch emits `desynced(tick, peer_id)` as before; the game decides what a spectator's desync means. The link test app reports it and the players carry on.
 
 In the link test app, a spectator with a 40 ms, 20 ms-jitter link to the host followed a match 23.5 ms behind the schedule on average (35.5 ms at most), with no stalls, while the two players stalled on no frames at all.
@@ -353,7 +354,7 @@ godot --headless --path . --script tests/test_demo.gd       # 41 checks, about 2
   - a host that doesn't play starting two guests' lockstep match, identical inputs and checksums on all three devices, over a clean and a lossy link;
   - a spectator following a lockstep match;
   - a slow spectator (20 fps, 120 ms away) never stalling the players or easing their schedules, and a late one catching up;
-  - a spectator that stops confirming being dropped once `keep_ticks` behind;
+  - a spectator that stops confirming being dropped once `keep_ticks` behind, and told so, again if it was away and reconnects;
   - a guest of another LocalNet version turned away.
 - **Content:**
   - offer and require, `can_start(false, true)`, and cached content not fetched again;
