@@ -20,9 +20,9 @@ extends RefCounted
 ## ([method timing_peers]), and since only players have slots, nobody waits on them. A
 ## spectator that falls more than [member LocalNetLockstep.keep_ticks] behind would keep
 ## the host from freeing old inputs, so the host stops holding inputs for it and emits
-## [signal spectator_dropped]. It also tells the spectator, once and again if it reconnects,
-## so the spectator's own input sync emits [signal dropped] rather than waiting for inputs
-## that will never come. What happens next is the game's choice: the spectator can leave,
+## [signal spectator_dropped]. It also tells the spectator, once and again if it reconnects
+## or its input sync turns up later (it started loading late), so the spectator's own input
+## sync emits [signal dropped] rather than waiting for inputs that will never come. What happens next is the game's choice: the spectator can leave,
 ## or stay in the lobby and watch the next match. A host that doesn't play also has slot
 ## -1; it relays as usual.
 
@@ -96,7 +96,8 @@ func _init(net_link: LocalNetLink, slots: int, own_slot: int, peer_slots: Dictio
 	for id in _peer_slots:
 		_acks[id] = _latest.duplicate()
 		_told[id] = _latest.duplicate()
-		_heard[id] = false
+		# A spectator speaks first, so a host that has already dropped it can say so.
+		_heard[id] = own_slot < 0 and not link.is_host
 		_advantage[id] = PackedInt32Array()
 	link.received.connect(_on_received)
 	link.peer_resumed.connect(_on_peer_resumed)
@@ -275,8 +276,9 @@ func report_checksum(tick: int, value: int) -> void:
 	_compare(tick)
 
 
-# Lets a dropped spectator know. Reliable, but lost if its connection is down, so it's
-# sent again when it reconnects.
+# Lets a dropped spectator know. Reliable, but lost if its connection is down or its input
+# sync didn't exist yet, so it's sent again when it reconnects, and in answer to any packet
+# it sends. A dropped spectator hears no inputs, so it only sends when it starts or comes back.
 func _tell_dropped(id: int) -> void:
 	link.send(id, LocalNetLink.CHANNEL_EVENTS, PackedByteArray([KIND_DROPPED]), true)
 	link.flush()
@@ -331,6 +333,8 @@ func _on_received(id: int, channel: int, bytes: PackedByteArray) -> void:
 	if bytes.is_empty() or not _peer_slots.has(id):
 		return
 	if channel == LocalNetLink.CHANNEL_REALTIME and bytes[0] == KIND_INPUTS:
+		if link.is_host and _dropped.has(id):
+			_tell_dropped(id)
 		_read_inputs(id, bytes)
 	elif channel == LocalNetLink.CHANNEL_EVENTS and bytes[0] == KIND_CHECKSUM and bytes.size() >= 9:
 		var tick := bytes.decode_u32(1)

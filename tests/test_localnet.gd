@@ -73,6 +73,8 @@ func run() -> void:
 	game_channels()
 	spectator_told_dropped()
 	wire_range()
+	spectator_load_wait()
+	late_spectators()
 	print("LOCALNET: %d checks, %d failures" % [checks, failures.size()])
 	for failure in failures:
 		print("  FAIL ", failure)
@@ -1833,25 +1835,25 @@ func spectator_drops_loading() -> void:
 	watcher.link.debug_drop_connection(LocalNetLink.HOST_ID, 1500)
 	pump(everyone, 1.0, func(): return host.state == "started")
 	check(host.state == "started" and not host.members[watcher.local_id].connected, "Its connection dropping lets the match start without it")
-	pump(everyone, 5.0, func(): return starts.has("watcher"))
-	check(starts.has("watcher"), "...and it joins the match on its return")
+	pump(everyone, 5.0, func(): return watcher.link.is_peer_connected(LocalNetLink.HOST_ID) and host.members[watcher.local_id].connected)
+	pump(everyone, 0.3)
+	check(not starts.has("watcher") and watcher.state == "preparing", "Back while the match runs, it hasn't loaded, so it doesn't start yet")
+	watcher.mark_loaded()
+	check(starts.has("watcher"), "...and joins the match once it has loaded")
 	for l in everyone:
 		l.leave()
-	# Dropped before its clock was synced.
+	# Decision 10: a spectator still syncing its clock never blocks the start, connected
+	# or not; a player whose connection drops still does.
 	host = spectated_lobby()
 	guest = join_lobby(host, "Guest")
 	pump([host, guest], 5.0, func(): return host.can_start())
 	watcher = join_as(host, "Watcher", "spectator")
 	pump([host, guest, watcher], 3.0, func(): return host.members.size() == 3)
 	var w := watcher.local_id
-	check(host.members.has(w) and not host.members[w].synced and not host.can_start(), "A spectator still syncing its clock holds up the start")
+	check(host.members.has(w) and not host.members[w].synced and host.can_start(), "A spectator still syncing its clock doesn't hold up the start")
 	watcher.link.debug_drop_connection(LocalNetLink.HOST_ID, 2500)
 	pump([host, guest, watcher], 0.5)
-	check(not host.members[w].connected and not host.members[w].synced and host.can_start(), "...but not once its connection has dropped")
-	var back := [false]
-	host.member_resumed.connect(func(id): back[0] = back[0] or (id == w and not host.can_start()))
-	pump([host, guest, watcher], 6.0, func(): return host.members[w].connected and host.members[w].synced)
-	check(back[0] and host.can_start(), "Back and still syncing it holds it up again, until it's synced")
+	check(not host.members[w].connected and host.can_start(), "...nor once its connection has dropped")
 	guest.link.debug_drop_connection(LocalNetLink.HOST_ID, 2500)
 	pump([host, guest, watcher], 0.5)
 	check(not host.can_start(), "A player whose connection drops is still waited for")
@@ -1859,10 +1861,12 @@ func spectator_drops_loading() -> void:
 		l.leave()
 
 
-# With wait_for_loading, the start waits for spectators to load, so it waits for their
-# content too: transfers pause once the match is preparing.
+# A spectator's content never holds up can_start(false, true), even with wait_for_loading:
+# one still downloading just doesn't load in time, and the start goes ahead once
+# spectator_load_wait_msec has passed (transfers pause during a match).
 func spectator_content_loading() -> void:
 	var host := spectated_lobby()
+	host.spectator_load_wait_msec = 1000
 	var guest := join_lobby(host, "Guest")
 	var watcher := join_as(host, "Watcher", "spectator")
 	pump([host, guest, watcher], 6.0, func(): return host.can_start() and host.members.size() == 3)
@@ -1880,17 +1884,16 @@ func spectator_content_loading() -> void:
 	var every := [4000, 4000, 4000, 4000, 60_000, 60_000]
 	var w := watcher.local_id
 	var watcher_missing := func(): return host.members[w].get("content", {}).get("missing", 1) != 0
-	pump_frames(things, every, 10.0, func(): return host.members[guest.local_id].get("content", {}).get("missing", 1) == 0)
-	check(watcher_missing.call() and not host.can_start(false, true), "With wait_for_loading, a spectator still fetching holds up can_start(false, true)")
-	host.wait_for_loading = false
-	check(host.can_start(false, true), "...which without it ignores spectators' content, as before")
-	host.wait_for_loading = true
-	pump_frames(things, every, 15.0, func(): return host.can_start(false, true))
-	check(host.can_start(false, true) and not watcher_missing.call(), "...until it holds everything")
+	pump_frames(things, every, 10.0, func(): return host.can_start(false, true))
+	check(watcher_missing.call() and host.can_start(false, true), "With wait_for_loading, a spectator still fetching doesn't hold up can_start(false, true)")
 	host.start()
 	host.mark_loaded()
-	pump_frames(things, every, 4.0, func(): return host.state == "started" and watcher.state == "started")
-	check(host.state == "started" and watcher.state == "started", "Then the start doesn't wait on a download that can't finish")
+	var began := Time.get_ticks_msec()
+	pump_frames(things, every, 4.0, func(): return host.state == "started")
+	var waited := Time.get_ticks_msec() - began
+	check(host.state == "started" and waited >= 900 and waited < 1600, "The start waits spectator_load_wait_msec for it, and no longer (%d ms)" % waited)
+	pump_frames(things, every, 1.0)
+	check(watcher.state == "preparing" and watcher_missing.call(), "...while it, still without the content, waits to load")
 	for c in [hc, gc, wc]:
 		c.close()
 	for l in [host, guest, watcher]:
@@ -2048,3 +2051,109 @@ func wire_range() -> void:
 		link.close()
 	guest.leave()
 	host.leave()
+
+
+# Decision 10: the start waits for spectators' loading only spectator_load_wait_msec after
+# the players have loaded, and not at all with 0; one that loads in time starts it at once.
+func spectator_load_wait() -> void:
+	check(LocalNetLobby.new(GAME, 1).spectator_load_wait_msec == 3000, "Spectators' loading is waited for 3 s by default")
+	# [wait msec, when the spectator loads (msec after the players, -1 never), expected start]
+	for case in [[1000, -1, "after the wait"], [0, -1, "at once"], [3000, 300, "when it loads"]]:
+		var host := spectated_lobby()
+		host.spectator_load_wait_msec = case[0]
+		var guest := join_lobby(host, "Guest")
+		var watcher := join_as(host, "Watcher", "spectator")
+		var everyone := [host, guest, watcher]
+		pump(everyone, 6.0, func(): return host.can_start() and host.members.size() == 3)
+		guest.preparing.connect(func(_c): guest.mark_loaded())
+		var starts := {}
+		host.started.connect(func(_c, at): starts["host"] = at)
+		watcher.started.connect(func(_c, at): starts["watcher"] = at)
+		host.start()
+		host.mark_loaded()
+		pump(everyone, 2.0, func(): return host.members[guest.local_id].loaded)
+		var players_loaded := Time.get_ticks_msec()
+		var loaded := [false]
+		pump(everyone, 5.0, func():
+			if case[1] >= 0 and not loaded[0] and Time.get_ticks_msec() - players_loaded >= case[1]:
+				loaded[0] = true
+				watcher.mark_loaded()
+			return host.state == "started")
+		var waited := Time.get_ticks_msec() - players_loaded
+		var expected: int = case[1] if case[1] >= 0 else case[0]
+		check(host.state == "started" and waited >= expected - 50 and waited < expected + 300, "Waiting %d ms for spectators, the start comes %s (%d ms)" % [case[0], case[2], waited])
+		if case[1] < 0:
+			pump(everyone, 0.5)
+			check(watcher.state == "preparing" and not starts.has("watcher"), "...a spectator still loading doesn't start yet")
+			watcher.mark_loaded()
+		pump(everyone, 1.0, func(): return starts.has("watcher"))
+		check(starts.has("watcher") and absi(starts.watcher - starts.get("host", 0)) < 5000, "...and once loaded it starts on the match's own clock")
+		for l in everyone:
+			l.leave()
+
+
+# A spectator that loads after the match has begun joins on the shared clock and catches
+# up, or is dropped once keep_ticks behind; either way the players never stall.
+func late_spectator(late_msec: int, label: String) -> Dictionary:
+	var host := spectated_lobby()
+	host.spectator_load_wait_msec = 100
+	var guest := join_lobby(host, "Guest")
+	var watcher := join_as(host, "Watcher", "spectator")
+	var lobbies := [host, guest, watcher]
+	pump(lobbies, 6.0, func(): return host.can_start() and host.members.size() == 3)
+	guest.preparing.connect(func(_c): guest.mark_loaded())
+	var runners := {}
+	var told := []
+	var dropped := []
+	var ticks := 480
+	for lobby in lobbies:
+		lobby.started.connect(func(_config, at):
+			var sync := LocalNetInputSync.new(lobby.link, 2, lobby.local_slot(), lobby.peer_slots(), 3, 2)
+			sync.dropped.connect(func(): told.append(lobby.local_id))
+			sync.spectator_dropped.connect(func(id): dropped.append(id))
+			var rng := RandomNumberGenerator.new()
+			rng.seed = lobby.local_slot() + 11
+			var history := PackedInt64Array()
+			var runner := LocalNetLockstep.new(sync, at, 120,
+				func(_t): return PackedByteArray([rng.randi() % 256, rng.randi() % 256]),
+				func(_t, inputs): history.append(hash(inputs)))
+			runners[lobby] = {"runner": runner, "history": history, "at": at})
+	host.start()
+	host.mark_loaded()
+	var since := [0]
+	var step := func():
+		if since[0] == 0 and runners.has(host):
+			since[0] = Time.get_ticks_msec()
+		if since[0] > 0 and watcher.state == "preparing" and Time.get_ticks_msec() - since[0] >= late_msec:
+			watcher.mark_loaded()
+		for lobby in runners:
+			var r: Dictionary = runners[lobby]
+			if r.runner.tick < ticks and not told.has(lobby.local_id):
+				r.runner.max_ticks_per_frame = mini(8, ticks - r.runner.tick)
+				r.runner.advance()
+			else:
+				r.runner.sync.flush()
+		return runners.size() == 3 and runners.keys().all(func(l): return runners[l].runner.tick >= ticks or told.has(l.local_id))
+	var finished := pump(lobbies, 25.0, step)
+	pump(lobbies, 0.3)
+	var players: Array = [runners.get(host, {}), runners.get(guest, {})]
+	var spectator: Dictionary = runners.get(watcher, {})
+	check(finished and players.all(func(r): return not r.is_empty() and r.runner.tick >= ticks), "%s: the players finish the match" % label)
+	check(players.all(func(r): return not r.is_empty() and r.runner.stalled_frames == 0), "%s: the players never stall (%s frames)" % [label, players.map(func(r): return r.runner.stalled_frames if r else -1)])
+	check(not spectator.is_empty() and absi(spectator.at - players[0].get("at", 0)) < 5000, "%s: the spectator starts on the match's own clock" % label)
+	var result := {"spectator": spectator, "players": players, "told": told, "dropped": dropped, "id": watcher.local_id}
+	for r in runners.values():
+		r.runner.sync.close()
+	for l in lobbies:
+		l.leave()
+	return result
+
+
+func late_spectators() -> void:
+	var late := late_spectator(1300, "Spectator loading 1.3 s late")
+	var spectator: Dictionary = late.spectator
+	if not spectator.is_empty():
+		check(spectator.runner.tick >= 480 and spectator.history == late.players[0].history, "Spectator loading 1.3 s late: it catches up and follows the whole match (tick %d)" % spectator.runner.tick)
+		check(late.told.is_empty() and late.dropped.is_empty(), "...without being dropped")
+	var later := late_spectator(4500, "Spectator loading 4.5 s late")
+	check(later.dropped == [later.id] and later.told == [later.id], "Spectator loading 4.5 s late: beyond keep_ticks, it's dropped and told so: %s, %s" % [later.dropped, later.told])
