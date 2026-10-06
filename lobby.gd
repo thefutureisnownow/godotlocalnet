@@ -19,12 +19,12 @@ extends RefCounted
 ## stop waiting early with [method give_up].
 ##
 ## Members are players or spectators ([member max_spectators]). Spectators have no slot
-## (-1) and never hold anything up: they don't count towards [member max_players], the
-## two players [method can_start] needs or [method suggested_delay], and [method can_start]
-## doesn't wait for their clock sync, ready flag or content. With [member wait_for_loading],
-## the start waits for their loading only [member spectator_load_wait_msec] after the players
-## have loaded; one that loads later still joins the match on the same clock, and catches up
-## or is dropped ([signal LocalNetInputSync.dropped]). [signal member_interrupted],
+## (-1) and never hold anything up: they don't count towards [member max_players],
+## [member min_players] or [method suggested_delay], and [method can_start] doesn't wait for
+## their clock sync, ready flag or content. With [member wait_for_loading], the start waits
+## for their loading only [member spectator_load_wait_msec] after the players have loaded;
+## one that loads later still joins the match on the same clock, and catches up or is
+## dropped ([signal LocalNetInputSync.dropped]). [signal member_interrupted],
 ## [signal member_resumed] and [signal member_left] fire for spectators too, so check
 ## [method is_spectator] before acting on them.
 ## A host can also stay out of the match itself ([code]host_plays[/code] in [method host]),
@@ -105,7 +105,11 @@ var game_id: String
 var version: int
 var is_host := false
 var local_id := 0
+## How many players may join. [method host] sets it from its [code]players[/code].
 var max_players := 2
+## How many players [method can_start] needs; at least 1. Spectators don't count, so with 1
+## a single player can start with others watching, such as a driver with a navigator.
+var min_players := 2
 ## How many guests may join to watch. 0 turns spectators away. Set it before [method host]:
 ## the link makes room for them then.
 var max_spectators := 0
@@ -283,20 +287,37 @@ func set_data(data: Dictionary) -> void:
 	_update_self({"data": data})
 
 
-## Host only: shared settings every member sees, such as stage or rules.
+## Host only: shared settings every member sees, such as stage or rules. Replaces the
+## whole config; [method merge_config] changes some keys and keeps the rest.
 func set_config(values: Dictionary) -> void:
 	if is_host:
 		config = values.duplicate(true)
 		_broadcast_members()
 
 
-## Host only: whether [method start] can go ahead: two players or more, every player
-## connected and synced (with [param require_ready], ready too; with [param require_content],
-## holding all the [member needed_content], as must the host itself). Spectators are never
+## Host only: sets the keys in [param values] and keeps the config's other keys. Members
+## hear about it once, and only if a value changed (a type counts: 1 isn't 1.0).
+func merge_config(values: Dictionary) -> void:
+	if not is_host:
+		return
+	var incoming := values.duplicate(true)
+	var changed := false
+	for key in incoming:
+		if not config.has(key) or var_to_bytes(config[key]) != var_to_bytes(incoming[key]):
+			config[key] = incoming[key]
+			changed = true
+	if changed:
+		_broadcast_members()
+
+
+## Host only: whether [method start] can go ahead: [member min_players] players or more
+## (and at least one), every player connected and synced (with [param require_ready], ready
+## too; with [param require_content], holding all the [member needed_content], as must the
+## host itself). Spectators are never
 ## waited for: one whose clock isn't synced yet still gets the start, and its lag behind the
 ## schedule absorbs a rough clock. One without the content just won't load in time.
 func can_start(require_ready := false, require_content := false) -> bool:
-	if not is_host or state != "lobby" or players().size() < 2:
+	if not is_host or state != "lobby" or players().size() < maxi(min_players, 1):
 		return false
 	for id in members:
 		var member: Dictionary = members[id]
