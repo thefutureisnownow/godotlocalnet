@@ -76,6 +76,8 @@ func run() -> void:
 	wire_range()
 	spectator_load_wait()
 	late_spectators()
+	config_merges()
+	min_players()
 	print("LOCALNET: %d checks, %d failures" % [checks, failures.size()])
 	for failure in failures:
 		print("  FAIL ", failure)
@@ -2178,3 +2180,60 @@ func late_spectators() -> void:
 		check(late.told.is_empty() and late.dropped.is_empty(), "...without being dropped")
 	var later := late_spectator(4500, "Spectator loading 4.5 s late")
 	check(later.dropped == [later.id] and later.told == [later.id], "Spectator loading 4.5 s late: beyond keep_ticks, it's dropped and told so: %s, %s" % [later.dropped, later.told])
+
+
+# merge_config sets some keys and keeps the rest, and tells members only when something
+# changed; set_config still replaces the lot.
+func config_merges() -> void:
+	var host := host_lobby()
+	var guest := join_lobby(host, "Guest")
+	pump([host, guest], 3.0, func(): return guest.members.size() == 2)
+	var sent := [0]
+	host.members_changed.connect(func(): sent[0] += 1)
+	host.set_config({"stage": 3, "rounds": 2})
+	var car := {"colour": 1}
+	host.merge_config({"rounds": 5, "weather": "rain", "car": car})
+	check(sent[0] == 2 and host.config == {"stage": 3, "rounds": 5, "weather": "rain", "car": {"colour": 1}}, "Merging config keeps the other keys, and goes out once (%s, %d)" % [host.config, sent[0]])
+	car.colour = 2
+	check(host.config.car.colour == 1, "...and keeps its own copy of what it was given")
+	pump([host, guest], 2.0, func(): return guest.config.get("weather") == "rain")
+	check(guest.config == {"stage": 3, "rounds": 5, "weather": "rain", "car": {"colour": 1}}, "The guest sees the merged config (%s)" % [guest.config])
+	sent[0] = 0
+	host.merge_config({"stage": 3, "car": {"colour": 1}})
+	host.merge_config({})
+	check(sent[0] == 0, "Merging what's already there sends nothing")
+	host.merge_config({"rounds": 5.0})
+	check(sent[0] == 1, "A value that changes type is a change")
+	pump([host, guest], 2.0, func(): return typeof(guest.config.get("rounds")) == TYPE_FLOAT)
+	check(typeof(guest.config.get("rounds")) == TYPE_FLOAT, "...and the guest gets it")
+	guest.merge_config({"stage": 9})
+	guest.set_config({"stage": 9})
+	pump([host, guest], 0.3)
+	check(host.config.stage == 3 and guest.config.stage == 3, "Only the host merges config")
+	host.set_config({"stage": 4})
+	pump([host, guest], 2.0, func(): return guest.config.get("stage") == 4)
+	check(host.config == {"stage": 4} and guest.config == {"stage": 4}, "set_config still replaces the whole config")
+	guest.leave()
+	host.leave()
+
+
+# One player can start with a spectator, such as a driver with a navigator, once
+# min_players allows it. By default it takes two.
+func min_players() -> void:
+	var host := LocalNetLobby.new(GAME, 1)
+	host.max_spectators = 1
+	check(host.min_players == 2, "min_players defaults to 2")
+	host.host("Driver", 1)
+	var navigator := join_as(host, "Navigator", "spectator")
+	pump([host, navigator], 4.0, func(): return host.members.get(navigator.local_id, {}).get("synced", false))
+	check(host.members.size() == 2 and not host.can_start(), "By default a player and a spectator can't start")
+	host.min_players = 1
+	check(host.can_start(), "With min_players 1 they can")
+	var runners := lockstep_match([host, navigator], 0.0, 0.0, 0.0, "Driver and navigator")
+	if runners.size() == 2:
+		check(runners[1].sync.is_spectating() and runners[1].tick >= 480, "Driver and navigator: the navigator follows the whole match")
+	var screen := LocalNetLobby.new(GAME, 1)
+	screen.min_players = 0
+	screen.host("Screen", 2, "", 0, false)
+	check(screen.players().is_empty() and not screen.can_start(), "Even with min_players 0, a start needs a player")
+	screen.leave()

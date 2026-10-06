@@ -27,7 +27,7 @@ Change LocalNet here, never in a game's copy. After the tests pass, bump `addons
 |---|---|
 | `LocalNetDiscovery` | Hosts answer UDP probes on port 47650, or the first free of 47651–47653 when another host on the same device has it. Scanners probe every address in each local IPv4 /24, plus broadcast where allowed, and list the hosts that reply. A scan can also target one typed address, which finds its game port. |
 | `LocalNetLink` | A thin ENet wrapper with one host, any number of clients and six channels: reliable control, unreliable real-time, reliable events and reliable content, plus a reliable and an unreliable channel of the game's own. The game port is chosen by the system or by the host. Dropped connections reconnect under the same id (see below). It can simulate loss, latency, jitter, hiccups and dropped connections for tests. |
-| `LocalNetLobby` | Join, reject (wrong game, version or code, or a full lobby), the member list, players and spectators, per-player data, shared settings, ready flags, clock sync, link quality and `suggested_delay()`. It can wait until everyone has loaded before a synchronized start, and returns to the lobby for rematches. The host can also stay out of the match and only relay (see below). |
+| `LocalNetLobby` | Join, reject (wrong game, version or code, or a full lobby), the member list, players and spectators, per-player data, shared settings (`set_config()` replaces them, `merge_config()` changes some keys), ready flags, clock sync, link quality and `suggested_delay()`. It can wait until everyone has loaded before a synchronized start, and returns to the lobby for rematches. The host can also stay out of the match and only relay (see below). |
 | `LocalNetInputSync` | Lockstep input exchange with input delay. Packets resend everything that hasn't been acknowledged, so losses cost nothing. The host relays when there are more than two players, and to spectators. It also offers checksum desync detection, and `predicted_inputs()` as the first building block for rollback. |
 | `LocalNetLockstep` | The per-frame loop: which ticks are due, sampling input ahead, stepping, checksums and freeing old inputs. After a stall it moves its schedule back instead of racing through the backlog, and it reports who it's waiting on. Time sync keeps devices' schedules together after hiccups or a misjudged clock offset (see below). |
 | `LocalNetContent` | Moves content (stages, skins, mods) between lobby members by hash before a match, so everyone holds the same bytes (see below). |
@@ -46,7 +46,8 @@ lobby.host("Kaap", 2)                        # guests: discovery.scan(), discove
 discovery.advertise(lobby.advert())
 
 # Host, when everyone is in: pick the delay from the pings, then start.
-lobby.set_config({"stage": 2, "delay": lobby.suggested_delay(120)})
+lobby.set_config({"stage": 2, "delay": lobby.suggested_delay(120)})   # replaces all the settings
+# lobby.merge_config({"delay": 4}) would change only "delay", and send nothing if it was 4 already.
 lobby.start()
 
 lobby.preparing.connect(func(config): load_fight(config); lobby.mark_loaded())
@@ -190,12 +191,13 @@ Every member has a role in the lobby, `"player"` or `"spectator"`. Roles are a l
 |---|---|
 | `lobby.max_spectators` | How many guests may join to watch. 0 by default, which turns them away ("Spectators aren't allowed"); past the limit it's "No room for spectators". Set it before `host()`, since the link makes room for them then. |
 | `lobby.join(address, port, name, code, "spectator")` | Joins to watch. Spectators must join before the match starts. |
+| `lobby.min_players` | How many players `can_start()` needs, 2 by default. Spectators don't count, so 1 lets a single player start while others watch, such as a driver with a friend navigating. A start always needs at least one player. |
 | `lobby.host(name, players, code, port, false)` | The host doesn't play: its member is a spectator and `players` guests play. For a PC driving a big screen or Tilt Five glasses while phones play. |
 | `lobby.spectator_load_wait_msec` | With `wait_for_loading`: how long the start waits for spectators still loading, counted from when every player has loaded. 3000 by default; 0 doesn't wait for them at all. |
 | `players()`, `spectators()`, `is_spectator(id)` | Member ids by role, and whether a member watches. A host that doesn't play is among the spectators. |
 | `advert()` | `players` counts players only; `spectators` and `max_spectators` are new, and discovery's sessions carry them. |
 
-Spectators have slot −1, and a spectator falling off or lagging never stops the game. They don't count towards `max_players`, the two players `can_start()` needs, `start()`'s slot numbering or `suggested_delay()`, and `can_start()` doesn't wait for anything of theirs: not a ready flag, not their content, not even their clock sync. A spectator whose clock isn't synced yet still gets the start; its lag behind the schedule absorbs a rough clock reading, and one too far off is dropped like any spectator that falls `keep_ticks` behind, and watches the next match.
+Spectators have slot −1, and a spectator falling off or lagging never stops the game. They don't count towards `max_players`, the `min_players` `can_start()` needs, `start()`'s slot numbering or `suggested_delay()`, and `can_start()` doesn't wait for anything of theirs: not a ready flag, not their content, not even their clock sync. A spectator whose clock isn't synced yet still gets the start; its lag behind the schedule absorbs a rough clock reading, and one too far off is dropped like any spectator that falls `keep_ticks` behind, and watches the next match.
 
 With `wait_for_loading`, the start waits for every player (and the host) to load, then for spectators still loading only up to `spectator_load_wait_msec` more, and not at all for one whose connection has dropped. A spectator that loads in time starts the match at once. One that loads later gets `started` when it calls `mark_loaded()`, with the match's own start time, as a guest that missed the start does, and catches up within `keep_ticks` or is dropped. Since transfers pause once a match is preparing, a spectator still fetching content simply doesn't load in time; it carries on fetching back in the lobby and watches the next match.
 
@@ -318,7 +320,7 @@ godot --headless --path . -- --join=127.0.0.1 --quit
 ## Tests
 
 ```sh
-godot --headless --path . --script tests/test_localnet.gd   # 427 checks, about 3 minutes
+godot --headless --path . --script tests/test_localnet.gd   # 447 checks, about 3 minutes
 godot --headless --path . --script tests/test_demo.gd       # 41 checks, about 2½ minutes
 ```
 
@@ -333,6 +335,7 @@ godot --headless --path . --script tests/test_demo.gd       # 41 checks, about 2
   - a host-chosen game port, and refusal of a taken one;
   - joining, and rejections for a wrong code, the wrong version, a full lobby or a match in progress;
   - settings and per-player data keeping their types;
+  - `merge_config()` keeping the other settings, copying what it's given, and sending only when a value (or its type) changes, while `set_config()` still replaces them all;
   - clock sync and a synchronized start;
   - waiting for everyone to load, including a player leaving mid-load;
   - rematches;
@@ -361,6 +364,7 @@ godot --headless --path . --script tests/test_demo.gd       # 41 checks, about 2
   - players and spectators counted apart in `can_start()`, the advert, slot numbering and the suggested delay;
   - a host that doesn't play starting two guests' lockstep match, identical inputs and checksums on all three devices, over a clean and a lossy link;
   - a spectator following a lockstep match;
+  - a player and a spectator held back by the default `min_players` of 2, then starting and playing a lockstep match with it at 1, and a start always needing a player;
   - a slow spectator (20 fps, 120 ms away) never stalling the players or easing their schedules, and a late one catching up;
   - a spectator that stops confirming being dropped once `keep_ticks` behind, and told so, again if it was away and reconnects;
   - a guest of another LocalNet version turned away, and one whose range of versions overlaps let in, with its version kept in its member dictionary.
