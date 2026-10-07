@@ -4,9 +4,11 @@ Offline local multiplayer for Godot 4: devices on the same Wi-Fi or phone hotspo
 
 The design follows Coldshift Racing's Flutter `net_core` (unicast subnet sweep for discovery, a host-owned lobby, clock sync, UDP for real-time traffic), rebuilt on Godot's built-in ENet.
 
-## Using it in a game
+## Getting started
 
-Games take the addon as a plain folder, pulled from the `addon` branch with git subtree, so they build with no extra steps:
+### Install
+
+LocalNet is a folder of scripts. Copy [`addons/localnet`](addons/localnet) into your project, or pull it with git subtree from the `addon` branch, which holds that folder alone:
 
 ```sh
 # Once, in the game's repo:
@@ -15,13 +17,99 @@ git subtree add --prefix=addons/localnet https://github.com/stained/godotlocalne
 git subtree pull --prefix=addons/localnet https://github.com/stained/godotlocalnet addon --squash
 ```
 
-Change LocalNet here, never in a game's copy. After the tests pass, bump `addons/localnet/VERSION`, commit, and run `tools/publish_addon.sh` to update the `addon` branch.
+The scripts register their class names, so there's no plugin to enable. LocalNet is developed and tested with Godot 4.7. Android exports need the `INTERNET`, `ACCESS_NETWORK_STATE`, `ACCESS_WIFI_STATE` and `CHANGE_WIFI_MULTICAST_STATE` permissions, and iOS exports need `NSLocalNetworkUsageDescription` (see [Platform notes](#platform-notes)).
 
-**Updating a game to 0.3:** bump the game's own protocol version (the `version` it gives `LocalNetDiscovery` and `LocalNetLobby`, such as Snoek'em's `PROTOCOL`), even if no game code changes. 0.3 adds three ENet channels (content, and two for the game's own use), and its lobby `hello` carries LocalNet's own wire version (`"ln": 3`) and the oldest one it still works with (`"ln_min": 3`). A 0.3 host turns away a guest without them (a 0.2 build), or one whose range doesn't overlap its own, as "Different LocalNet version", but a 0.2 host ignores them and would let a 0.3 guest in. Bumping the game's version keeps old and new builds apart on both sides, and discovery lists the other build as incompatible.
+### How a session goes
 
-**LocalNet's wire version** (`LocalNetLobby.WIRE_VERSION` and `WIRE_VERSION_MIN`) is kept apart from the game's. A host lets a guest in when their ranges overlap: the guest's `ln` is at least the host's `ln_min`, and the host's `ln` at least the guest's `ln_min`. A change that older peers can do without, such as a new message they'd ignore, raises `ln` only, so old and new builds still meet. A change that breaks older peers raises `ln_min` too. Each member's `ln` is kept in its member dictionary (`members[id].ln`), so a feature added later can check which members have it.
+Everything is poll-driven `RefCounted` objects, with no autoloads, RPCs or scene-tree multiplayer. How a game keeps its devices' state the same is up to the game. Discovery, the lobby, the link and content get everyone into a match together, and work the same whatever happens in it. `LocalNetInputSync` and `LocalNetLockstep` are optional helpers for games that choose lockstep; a game that sends its own state snapshots uses neither, and sends them over `lobby.link` on the game's own channels (see [Channels and kind bytes](#channels-and-kind-bytes)).
 
-## The addon
+**1. Create discovery and a lobby, and poll them every frame.** Both take the game's id and its protocol version. Scanners only list sessions of the same game and mark other versions incompatible, and the lobby turns other versions away. Bump the version whenever the game's messages or rules change.
+
+```gdscript
+var discovery := LocalNetDiscovery.new("mygame", 1)
+var lobby := LocalNetLobby.new("mygame", 1)
+var lockstep: LocalNetLockstep
+
+func _process(_delta):
+	discovery.poll()
+	lobby.poll()            # The lobby's signals fire from here.
+	if lockstep:
+		lockstep.advance()
+```
+
+**2. Host, and advertise the session.**
+
+```gdscript
+LocalNetWifiRoute.bind()                   # Android: keep sockets on Wi-Fi. Does nothing elsewhere.
+lobby.host("Kaap", 2)                      # Name and players; optionally a join code, a port, and host_plays.
+discovery.advertise(lobby.advert())
+# Every frame while hosting, so scanners see the current player count:
+discovery.update_info(lobby.advert())
+```
+
+**3. Or find a session and join it.** Each session is a Dictionary: `name`, `address`, `port`, `players`, `max_players`, `spectators`, `max_spectators`, `state`, `compatible` (the same version), `code_required` and `ping_ms`.
+
+```gdscript
+LocalNetWifiRoute.bind()
+discovery.scan()                           # Sweeps every local /24 once a second. scan(["192.168.1.20"]) probes a typed address.
+# Later, from discovery.sessions():
+if session.compatible and session.state == "lobby" and session.players < session.max_players:
+	discovery.stop()
+	lobby.join(session.address, session.port, "Blaas")   # Then joined(id), or rejected(reason).
+```
+
+**4. Gather.** `lobby.members` maps each member's id to a Dictionary (`name`, `slot`, `role`, `ready`, `connected`, `data` and more), and `members_changed` fires whenever it changes. Each device can `set_ready(true)` and `set_data({...})` for its own choices. The host shares settings as `lobby.config`: `set_config()` replaces them all and `merge_config()` changes some keys.
+
+**5. Start.** The host waits for `can_start()`: enough players (`min_players`, 2 by default), every one connected and with its clock synced. `can_start(true)` also wants them ready, and `can_start(false, true)` wants them holding the match's content. The host picks an input delay from the measured links and starts:
+
+```gdscript
+if lobby.can_start():
+	lobby.set_config({"delay": lobby.suggested_delay(60)})   # 60 ticks a second.
+	lobby.start()
+```
+
+Every device then gets `started(config, start_usec)`, at the same wall-clock moment on every device. With `wait_for_loading` on, everyone gets `preparing(config)` first, loads the match, and calls `mark_loaded()`.
+
+**6. Play.** With the lockstep helpers, the game gives three functions: this device's input for a tick, a step of the whole game with every player's input, and a hash of its state. The step must give the same result on every device: integers only, no randomness that isn't seeded and shared, and nothing that depends on frame times.
+
+```gdscript
+lobby.started.connect(func(config, start_usec):
+	var sync := LocalNetInputSync.new(lobby.link, lobby.players().size(), lobby.local_slot(), lobby.peer_slots(), config.delay, 1)
+	sync.desynced.connect(func(tick, peer_id): push_error("Desync at tick %d" % tick))
+	lockstep = LocalNetLockstep.new(sync, start_usec, 60, sample_input, step, checksum))
+
+func sample_input(tick: int) -> PackedByteArray: ...                  # 1 byte here, the last argument above.
+func step(tick: int, inputs: Array[PackedByteArray]) -> void: ...     # One input per player, in slot order.
+func checksum() -> int: ...
+```
+
+**7. Rematch, or leave.** The host calls `return_to_lobby()`, and everyone gets `returned`: close the sync (`lockstep.sync.close()`) and drop the lockstep. Call `leave()` (and `discovery.stop()`, `LocalNetWifiRoute.release()`) when the player leaves or the game quits, so the others hear at once. Guests get `closed(reason)` when the host goes.
+
+Along the way, a game should handle `rejected` and `closed`, and `member_left`. If a dropped connection comes back within the reconnect window, everything carries on (see [Dropped connections](#dropped-connections)); `member_interrupted` and `member_resumed` let the game show that. `member_left` fires for spectators too, after the member has gone from `members`, so keep the ids that were playing when the match started to tell the two apart.
+
+### Examples
+
+[`examples/`](examples) holds five small games. They all play the same lockstep game, in which each player steers a dot with the arrow keys ([`examples/shared/dots.gd`](examples/shared/dots.gd)), but each sets up its sessions differently. Each example's script holds all of its LocalNet code, from discovery to leaving. Start with `player_vs_player`: it has the most comments, and the others only comment on what's different.
+
+| Example | Shows |
+|---|---|
+| [`player_vs_player`](examples/player_vs_player/player_vs_player.gd) | Discovery, hosting and joining, ready flags, the suggested delay, a lockstep match, rematches, and messages while a dropped connection reconnects. |
+| [`spectators`](examples/spectators/spectators.gd) | `max_spectators`, joining to play or to watch, spectators following the players' relayed inputs, and a spectator that falls too far behind being dropped. |
+| [`solo_with_spectator`](examples/solo_with_spectator/solo_with_spectator.gd) | One player with a spectator watching, like a driver with a friend navigating: `min_players = 1`, and settings changed one at a time with `merge_config()`. |
+| [`big_screen`](examples/big_screen/big_screen.gd) | A host that doesn't play (`host_plays` false), such as a PC on a TV showing the match while two phones play. |
+| [`content_sharing`](examples/content_sharing/content_sharing.gd) | A stage the host makes up and every device fetches with `LocalNetContent` before the match: `can_start(false, true)`, and `wait_for_loading` with `preparing` and `mark_loaded()`. |
+
+To try one, run its scene on two devices on the same network, or twice on one machine: in the editor with Debug > Customize Run Instances, or from a shell, once per window:
+
+```sh
+godot --path . examples/player_vs_player/player_vs_player.tscn
+```
+
+One window hosts and the other joins from its list. `tests/test_examples.gd` plays every example through, host and guests in one process, so they keep working as LocalNet changes.
+
+## API at a glance
+
+Every class and member is documented in its script, and Godot's built-in help shows it: press F1 (Search Help) and type `LocalNetLobby`, say.
 
 | Class | Job |
 |---|---|
@@ -34,28 +122,43 @@ Change LocalNet here, never in a game's copy. After the tests pass, bump `addons
 | `LocalNetWifiRoute` | On Android, binds the game's sockets to Wi-Fi (see Platform notes); elsewhere it does nothing. Call `bind()` before hosting, scanning or joining, and `release()` on leaving. |
 | `LocalNetLatencyStats` | Measures how late remote inputs arrive, how often a given input delay would stall, and how deep rollback would need to go. |
 
-Everything is poll-driven `RefCounted` objects, with no autoloads, RPCs or scene-tree multiplayer. Call `poll()` on the discovery and lobby (and content, if used) at the start of each frame.
+### LocalNetLobby
 
-How a game keeps its devices' state the same is up to the game. Discovery, the lobby, the link and content get everyone into a match together, and work the same whatever happens in it. `LocalNetInputSync` and `LocalNetLockstep` are optional helpers for games that choose lockstep; a game that sends its own state snapshots over the link uses neither.
+| Settings | |
+|---|---|
+| `max_spectators` | How many guests may join to watch; 0 (the default) turns them away. Set it before `host()`. |
+| `min_players` | How many players `can_start()` needs. 2 by default. |
+| `max_players` | How many players may join. `host()` sets it. |
+| `wait_for_loading` | `start()` sends `preparing` first and waits for everyone's `mark_loaded()`. |
+| `spectator_load_wait_msec` | With `wait_for_loading`, how long the start waits for spectators still loading. |
+| `reconnect_window_msec` | How long a dropped member may take to come back. Set on the host; guests follow. |
 
-```gdscript
-var discovery := LocalNetDiscovery.new("snoekem", 1)
-var lobby := LocalNetLobby.new("snoekem", 1)
-lobby.wait_for_loading = true
-lobby.host("Kaap", 2)                        # guests: discovery.scan(), discovery.sessions(), lobby.join(address, port, "Blaas")
-discovery.advertise(lobby.advert())
+| Calls | |
+|---|---|
+| `host(name, players, code, port, host_plays)`, `join(address, port, name, code, role)`, `leave()`, `poll()` | Open, join or leave a session; poll every frame. |
+| `members`, `config`, `state`, `is_host`, `local_id` | The member list, the shared settings, and `"idle"`, `"joining"`, `"lobby"`, `"preparing"`, `"started"` or `"closed"`. |
+| `players()`, `spectators()`, `is_spectator(id)`, `local_slot()`, `peer_slots()` | Who plays and who watches, and the slots lockstep needs. |
+| `set_ready(ready)`, `set_data(data)` | This device's ready flag and choices, seen by everyone. |
+| `set_config(values)`, `merge_config(values)` | Host: replace the shared settings, or change some keys. |
+| `can_start(require_ready, require_content)`, `suggested_delay(tick_rate)`, `start()` | Host: whether everyone's there, an input delay from the measured links, and the synchronized start. |
+| `mark_loaded()`, `return_to_lobby()`, `give_up(id)` | This device has loaded; host: end the match; stop waiting for a dropped connection. |
+| `advert()` | What discovery should tell scanners. |
 
-# Host, when everyone is in: pick the delay from the pings, then start.
-lobby.set_config({"stage": 2, "delay": lobby.suggested_delay(120)})   # replaces all the settings
-# lobby.merge_config({"delay": 4}) would change only "delay", and send nothing if it was 4 already.
-lobby.start()
+| Signals | |
+|---|---|
+| `joined(id)`, `rejected(reason)`, `closed(reason)` | This device got in, was turned away, or the session ended for it. |
+| `members_changed` | The member list or settings changed. |
+| `member_left(id, reason)` | A member left, was kicked or was lost for good. It fires after the member has gone from `members`. |
+| `member_interrupted(id)`, `member_resumed(id)`, `connection_interrupted`, `connection_resumed` | Dropped connections and their return. |
+| `preparing(config)`, `started(config, start_usec)`, `returned` | Load the match; play it; back in the lobby. |
 
-lobby.preparing.connect(func(config): load_fight(config); lobby.mark_loaded())
-lobby.started.connect(func(config, start_usec):
-	var sync := LocalNetInputSync.new(lobby.link, lobby.players().size(), lobby.local_slot(), lobby.peer_slots(), config.delay, 2)
-	lockstep = LocalNetLockstep.new(sync, start_usec, 120, read_pad, step_fight, hash_fight))
-# Every frame: lockstep.advance(). After the match the host calls lobby.return_to_lobby().
-```
+### LocalNetDiscovery
+
+`advertise(info, port)`, `update_info(info)` and `stop_advertising()` on the host; `scan(targets)`, `sessions()`, `stop_scanning()` and `session_found(session)` on scanners; `stop()` for both.
+
+### LocalNetInputSync and LocalNetLockstep
+
+`LocalNetInputSync.new(link, players, own_slot, peer_slots, delay, bytes_per_input)` exchanges inputs; `close()` it after the match. Its signals are `desynced(tick, peer_id)`, `spectator_dropped(peer_id)` on the host, and `dropped` on a spectator that fell too far behind. `LocalNetLockstep.new(sync, start_usec, ticks_per_second, sample_input, step, checksum)` runs the game: call `advance()` every frame. Its `waiting(slots)` and `resumed(stalled_usec)` signals report stalls, and `predict`, `time_sync` and `keep_ticks` tune it.
 
 ## Wire protocol
 
@@ -135,7 +238,7 @@ Leaving on purpose (`close()`) or being kicked sends a reason with the disconnec
 | Layer | Signals |
 |---|---|
 | `LocalNetLink` | `peer_interrupted(id)`, `peer_resumed(id)`, `peer_disconnected(id, reason)`, where the reason is "left", "kicked" or "lost". `interrupted_peers()` and `reconnect_seconds_left(id)` support a countdown. |
-| `LocalNetLobby`, everyone | `member_interrupted(id)`, `member_resumed(id)`, `member_left(id, reason)`, and each member's `connected` flag. `can_start()` waits for every player to be connected. These fire for spectators too: check `is_spectator(id)` before acting on them (see Players and spectators). |
+| `LocalNetLobby`, everyone | `member_interrupted(id)`, `member_resumed(id)`, `member_left(id, reason)`, and each member's `connected` flag. `can_start()` waits for every player to be connected. These fire for spectators too (see Players and spectators). |
 | `LocalNetLobby`, guest | `connection_interrupted`, `connection_resumed`. When the window runs out: `closed("Lost connection to the host")`. |
 
 Anything the host sent while a guest was away is lost, so on resume it resends the member list and settings, and whether a match started, is loading or has ended. A guest that missed the start joins the match on the same clock as everyone else. A guest that comes back after the host has let it go is told so, rather than being let in as a stranger.
@@ -201,7 +304,7 @@ Spectators have slot −1, and a spectator falling off or lagging never stops th
 
 With `wait_for_loading`, the start waits for every player (and the host) to load, then for spectators still loading only up to `spectator_load_wait_msec` more, and not at all for one whose connection has dropped. A spectator that loads in time starts the match at once. One that loads later gets `started` when it calls `mark_loaded()`, with the match's own start time, as a guest that missed the start does, and catches up within `keep_ticks` or is dropped. Since transfers pause once a match is preparing, a spectator still fetching content simply doesn't load in time; it carries on fetching back in the lobby and watches the next match.
 
-`member_interrupted`, `member_resumed` and `member_left` fire for spectators as well as players, so a game should check `is_spectator(id)` before acting on them: one that ends a match whenever a member leaves would end it when a spectator leaves. The exception is a host that doesn't play. It's a spectator by role, but it's the hub every device connects through and there's no host migration, so it's waited for like a player (its loading and, with `can_start(..., true)`, its content), and when it goes, the session ends for everyone, as with any host (`closed` on the guests).
+`member_interrupted`, `member_resumed` and `member_left` fire for spectators as well as players, so a game should check which it is before acting on them: one that ends a match whenever a member leaves would end it when a spectator leaves. For the first two, `is_spectator(id)` says. `member_left` fires after the member has gone from `members`, when `is_spectator(id)` can no longer tell, so keep the ids that were playing (`players()`) when the match started, as the [examples](#examples) do. The exception is a host that doesn't play. It's a spectator by role, but it's the hub every device connects through and there's no host migration, so it's waited for like a player (its loading and, with `can_start(..., true)`, its content), and when it goes, the session ends for everyone, as with any host (`closed` on the guests).
 
 A navigator or co-driver isn't a role. Anything that changes the game has to reach every device, so in lockstep a co-driver is just another player slot whose input means something else; the game says so in member data.
 
@@ -278,7 +381,7 @@ Scanners probe the fallback ports on their own device every sweep, and across th
 
 ## Link test app
 
-`demo/` is a 120 Hz toy game that runs the whole stack and reports the numbers. One device hosts and the others join. Joining can be from the list, by typing `address:port`, or by typing just the address.
+`demo/` is a 120 Hz toy game that runs the whole stack and reports the numbers: a tool for measuring links, where the [examples](#examples) are for reading. One device hosts and the others join. Joining can be from the list, by typing `address:port`, or by typing just the address.
 
 - **Lockstep mode** waits for every input. It counts frozen frames and checks that the state stays identical.
 - **Free-run mode** never waits: it guesses missing inputs the way rollback would, so it measures the network alone.
@@ -317,11 +420,24 @@ godot --headless --path . -- --host --seconds=10 --matches=2 --quit &
 godot --headless --path . -- --join=127.0.0.1 --quit
 ```
 
+## Versions
+
+Each game has its own protocol version, the one it gives `LocalNetDiscovery` and `LocalNetLobby`. LocalNet has a wire version of its own, and `addons/localnet/VERSION` says which release a copy of the addon is.
+
+**Updating a game to 0.3:** bump the game's own protocol version (the `version` it gives `LocalNetDiscovery` and `LocalNetLobby`, such as Snoek'em's `PROTOCOL`), even if no game code changes. 0.3 adds three ENet channels (content, and two for the game's own use), and its lobby `hello` carries LocalNet's own wire version (`"ln": 3`) and the oldest one it still works with (`"ln_min": 3`). A 0.3 host turns away a guest without them (a 0.2 build), or one whose range doesn't overlap its own, as "Different LocalNet version", but a 0.2 host ignores them and would let a 0.3 guest in. Bumping the game's version keeps old and new builds apart on both sides, and discovery lists the other build as incompatible.
+
+**LocalNet's wire version** (`LocalNetLobby.WIRE_VERSION` and `WIRE_VERSION_MIN`) is kept apart from the game's. A host lets a guest in when their ranges overlap: the guest's `ln` is at least the host's `ln_min`, and the host's `ln` at least the guest's `ln_min`. A change that older peers can do without, such as a new message they'd ignore, raises `ln` only, so old and new builds still meet. A change that breaks older peers raises `ln_min` too. Each member's `ln` is kept in its member dictionary (`members[id].ln`), so a feature added later can check which members have it.
+
+## Working on LocalNet
+
+Change LocalNet in this repo, never in a game's copy. After the tests pass, bump `addons/localnet/VERSION`, commit, and run `tools/publish_addon.sh` to update the `addon` branch, which games pull.
+
 ## Tests
 
 ```sh
 godot --headless --path . --script tests/test_localnet.gd   # 447 checks, about 3 minutes
 godot --headless --path . --script tests/test_demo.gd       # 41 checks, about 2½ minutes
+godot --headless --path . --script tests/test_examples.gd   # 64 checks, about 35 seconds
 ```
 
 `test_localnet.gd` runs hosts and clients side by side over loopback. A pair of input syncs wired together in memory lets the lockstep rules be checked tick by tick. It covers:
@@ -395,6 +511,8 @@ godot --headless --path . --script tests/test_demo.gd       # 41 checks, about 2
 - a host that doesn't play, with two guests;
 - 8 MB of content fetched before a match;
 - every process quitting on its own.
+
+`test_examples.gd` plays each of the [examples](#examples) with a host and its guests in one process, through the examples' own functions: finding the host by discovery, joining, starting, playing with keys held until every device shows the same dots and checksums, coming back to the lobby, and the guests going home when the host leaves. Along the way it checks ready flags and a rematch, a spectator with no slot leaving without ending anything, the solo lobby able to start alone and keeping both settings merged one at a time, a host that doesn't play, and a stage fetched, cached by its hash and loaded the same everywhere.
 
 ## Measurements (2026-09-28)
 

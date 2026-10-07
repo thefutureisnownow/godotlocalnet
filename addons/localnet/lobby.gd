@@ -26,7 +26,8 @@ extends RefCounted
 ## one that loads later still joins the match on the same clock, and catches up or is
 ## dropped ([signal LocalNetInputSync.dropped]). [signal member_interrupted],
 ## [signal member_resumed] and [signal member_left] fire for spectators too, so check
-## [method is_spectator] before acting on them.
+## [method is_spectator] before acting on them. [signal member_left] fires once the member
+## has gone from [member members], so keep the [method players] a match started with.
 ## A host can also stay out of the match itself ([code]host_plays[/code] in [method host]),
 ## as a PC driving a big screen while phones play: its member is then a spectator too. It's
 ## still the hub everyone's connected through, so it's waited for like a player: its loading
