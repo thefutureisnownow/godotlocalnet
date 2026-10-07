@@ -23,7 +23,6 @@ var dots := Dots.new()
 var menu := Menu.new()
 var _listed := []
 var _start_button: Button
-var _playing := []
 
 
 func _ready() -> void:
@@ -127,9 +126,9 @@ func start_match() -> void:
 # The screen's local_slot() is -1, so it samples nothing. Unlike a spectating guest, it
 # hears every input first-hand and shows the match on time.
 func begin_match(config: Dictionary, start_usec: int) -> void:
-	_playing = lobby.players()
-	dots.reset(_playing.size())
-	var sync := LocalNetInputSync.new(lobby.link, _playing.size(), lobby.local_slot(), lobby.peer_slots(), config.delay, 1)
+	var players := lobby.players().size()
+	dots.reset(players)
+	var sync := LocalNetInputSync.new(lobby.link, players, lobby.local_slot(), lobby.peer_slots(), config.delay, 1)
 	lockstep = LocalNetLockstep.new(sync, start_usec, TICK_RATE, dots.sample_input, dots.step, dots.checksum)
 	_start_button = null
 	menu.clear()
@@ -150,7 +149,7 @@ func _on_returned() -> void:
 
 
 func _on_member_left(id: int, _reason: String) -> void:
-	if lobby.is_host and lobby.state == "started" and id in _playing:
+	if lobby.is_host and lobby.state == "started" and not lobby.is_spectator(id):
 		lobby.return_to_lobby()
 	elif lobby.state == "lobby":
 		_show_status()

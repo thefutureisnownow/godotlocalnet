@@ -26,8 +26,7 @@ extends RefCounted
 ## one that loads later still joins the match on the same clock, and catches up or is
 ## dropped ([signal LocalNetInputSync.dropped]). [signal member_interrupted],
 ## [signal member_resumed] and [signal member_left] fire for spectators too, so check
-## [method is_spectator] before acting on them. [signal member_left] fires once the member
-## has gone from [member members], so keep the [method players] a match started with.
+## [method is_spectator] before acting on them (it still knows a member that has just left).
 ## A host can also stay out of the match itself ([code]host_plays[/code] in [method host]),
 ## as a PC driving a big screen while phones play: its member is then a spectator too. It's
 ## still the hub everyone's connected through, so it's waited for like a player: its loading
@@ -146,6 +145,9 @@ var clock_offset_usec := 0
 var clock_rtt_usec := 0
 
 var _join_code_hash := ""
+# Host: the roles of members who have left this session, so is_spectator() still answers
+# in member_left handlers.
+var _left_roles := {}
 var _name := ""
 var _samples := []
 var _round_trips := PackedInt64Array()
@@ -199,6 +201,7 @@ func host(player_name: String, players := 2, join_code := "", port := 0, host_pl
 	session_id = "%08x%08x" % [randi(), randi()]
 	session_name = player_name
 	_join_code_hash = _hash_code(join_code)
+	_left_roles.clear()
 	members = {local_id: _member(player_name, 0, PLAYER) if host_plays else _member(player_name, -1, SPECTATOR)}
 	needed_content = []
 	_needed_key = ""
@@ -223,6 +226,7 @@ func join(address: String, port: int, player_name: String, join_code := "", role
 	needed_content = []
 	_needed_key = ""
 	_join_code_hash = _hash_code(join_code)
+	_left_roles.clear()
 	_samples.clear()
 	_round_trips.clear()
 	_joined_usec = Time.get_ticks_usec()
@@ -274,10 +278,13 @@ func spectators() -> Array:
 	return _ids_with_role(SPECTATOR)
 
 
-## True when member [param id] (this device by default) watches rather than plays.
+## True when member [param id] (this device by default) watches rather than plays. On the
+## host it still answers for a member that has left, as in a [signal member_left] handler.
 func is_spectator(id := -1) -> bool:
-	var member: Dictionary = members.get(local_id if id == -1 else id, {})
-	return member.get("role", PLAYER) == SPECTATOR
+	var key := local_id if id == -1 else id
+	if not members.has(key):
+		return _left_roles.get(key, PLAYER) == SPECTATOR
+	return members[key].get("role", PLAYER) == SPECTATOR
 
 
 func set_ready(ready: bool) -> void:
@@ -584,6 +591,7 @@ func _on_peer_disconnected(id: int, reason: String) -> void:
 			closed.emit("The host left" if reason == "left" else "Lost connection to the host")
 		return
 	if members.has(id):
+		_left_roles[id] = members[id].get("role", PLAYER)
 		members.erase(id)
 		member_left.emit(id, reason)
 		_broadcast_members()
@@ -650,6 +658,7 @@ func _host_message(id: int, message: Dictionary) -> void:
 				return
 			var player_name := str(message.get("name", "Player")).left(24)
 			members[id] = _member(player_name, -1, SPECTATOR) if watching else _member(player_name, _free_slot())
+			_left_roles.erase(id)
 			members[id].ln = message.ln
 			_send(id, {"t": "welcome", "id": id, "reconnect_window_msec": reconnect_window_msec})
 			_broadcast_members()

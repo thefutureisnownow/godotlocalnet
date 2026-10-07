@@ -21,7 +21,6 @@ var dots := Dots.new()
 var menu := Menu.new()
 var _listed := []
 var _start_button: Button
-var _playing := []
 
 
 func _ready() -> void:
@@ -131,9 +130,9 @@ func start_match() -> void:
 # Players and spectators run the same code. A spectator's local_slot() is -1, so it never
 # samples input; it follows the inputs the host relays, a few ticks behind the players.
 func begin_match(config: Dictionary, start_usec: int) -> void:
-	_playing = lobby.players()
-	dots.reset(_playing.size())
-	var sync := LocalNetInputSync.new(lobby.link, _playing.size(), lobby.local_slot(), lobby.peer_slots(), config.delay, 1)
+	var players := lobby.players().size()
+	dots.reset(players)
+	var sync := LocalNetInputSync.new(lobby.link, players, lobby.local_slot(), lobby.peer_slots(), config.delay, 1)
 	# On a spectator: it fell too far behind and the host stopped sending it inputs.
 	sync.dropped.connect(_on_dropped)
 	# On the host: which spectator it gave up on.
@@ -163,10 +162,9 @@ func _on_returned() -> void:
 
 
 # member_left fires for spectators too, and a spectator leaving shouldn't end the match.
-# The member is already gone from lobby.members by now, so check the ids that were
-# playing when the match started.
+# The member has gone from lobby.members by now, but is_spectator() still knows it.
 func _on_member_left(id: int, _reason: String) -> void:
-	if lobby.is_host and lobby.state == "started" and id in _playing:
+	if lobby.is_host and lobby.state == "started" and not lobby.is_spectator(id):
 		lobby.return_to_lobby()
 	elif lobby.state == "lobby":
 		_show_status()

@@ -78,6 +78,7 @@ func run() -> void:
 	late_spectators()
 	config_merges()
 	min_players()
+	left_roles()
 	print("LOCALNET: %d checks, %d failures" % [checks, failures.size()])
 	for failure in failures:
 		print("  FAIL ", failure)
@@ -2237,3 +2238,28 @@ func min_players() -> void:
 	screen.host("Screen", 2, "", 0, false)
 	check(screen.players().is_empty() and not screen.can_start(), "Even with min_players 0, a start needs a player")
 	screen.leave()
+
+
+# A member is gone from members by the time member_left fires, but is_spectator() still
+# knows its role there, for the rest of the session.
+func left_roles() -> void:
+	var host := LocalNetLobby.new(GAME, 1)
+	host.max_spectators = 1
+	host.host("Host", 2)
+	var player := join_lobby(host, "Player")
+	var watcher := join_as(host, "Watcher", "spectator")
+	var everyone := [host, player, watcher]
+	pump(everyone, 3.0, func(): return host.members.size() == 3)
+	var seen := {}
+	host.member_left.connect(func(id, _reason): seen[id] = [host.members.has(id), host.is_spectator(id)])
+	var p := player.local_id
+	var w := watcher.local_id
+	watcher.leave()
+	player.leave()
+	pump([host], 3.0, func(): return seen.size() == 2)
+	check(seen.get(w) == [false, true] and seen.get(p) == [false, false], "In member_left, a member that left is gone, and is_spectator() still knows its role (%s)" % [seen])
+	check(host.is_spectator(w) and not host.is_spectator(p), "...afterwards too")
+	host.leave()
+	host.host("Host", 2)
+	check(not host.is_spectator(w), "A new session forgets who left the last one")
+	host.leave()

@@ -151,9 +151,14 @@ func spectators() -> void:
 		check(host.lobby.players().size() == 2 and host.lobby.spectators() == [watcher.lobby.local_id], "%s: two players and a spectator" % label)
 		await wait_until(4.0, func(): return host.lobby.can_start())
 		if await play([host, player, watcher], label):
+			host.start_match()
+			await wait_until(5.0, func(): return host.lockstep != null and player.lockstep != null and watcher.lockstep != null)
 			watcher.queue_free()
 			await wait_until(3.0, func(): return host.lobby.spectators().is_empty())
-			check(host.lobby.spectators().is_empty() and host.lobby.players().size() == 2, "%s: the watcher leaves, the players stay" % label)
+			await wait(0.5)
+			check(host.lobby.spectators().is_empty() and host.lobby.state == "started" and player.lockstep != null, "%s: the watcher leaves mid-match, and the match goes on" % label)
+			host.lobby.return_to_lobby()
+			await wait_until(3.0, func(): return player.lobby.state == "lobby")
 	await host_leaves([host, player], label)
 
 

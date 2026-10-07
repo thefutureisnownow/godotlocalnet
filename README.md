@@ -85,7 +85,7 @@ func checksum() -> int: ...
 
 **7. Rematch, or leave.** The host calls `return_to_lobby()`, and everyone gets `returned`: close the sync (`lockstep.sync.close()`) and drop the lockstep. Call `leave()` (and `discovery.stop()`, `LocalNetWifiRoute.release()`) when the player leaves or the game quits, so the others hear at once. Guests get `closed(reason)` when the host goes.
 
-Along the way, a game should handle `rejected` and `closed`, and `member_left`. If a dropped connection comes back within the reconnect window, everything carries on (see [Dropped connections](#dropped-connections)); `member_interrupted` and `member_resumed` let the game show that. `member_left` fires for spectators too, after the member has gone from `members`, so keep the ids that were playing when the match started to tell the two apart.
+Along the way, a game should handle `rejected` and `closed`, and `member_left`. If a dropped connection comes back within the reconnect window, everything carries on (see [Dropped connections](#dropped-connections)); `member_interrupted` and `member_resumed` let the game show that. `member_left` fires for spectators too, so check `is_spectator(id)` before ending a match over it: it still answers for a member that has just left.
 
 ### Examples
 
@@ -148,7 +148,7 @@ Every class and member is documented in its script, and Godot's built-in help sh
 |---|---|
 | `joined(id)`, `rejected(reason)`, `closed(reason)` | This device got in, was turned away, or the session ended for it. |
 | `members_changed` | The member list or settings changed. |
-| `member_left(id, reason)` | A member left, was kicked or was lost for good. It fires after the member has gone from `members`. |
+| `member_left(id, reason)` | Host: a member left, was kicked or was lost for good. It's gone from `members` by then, but `is_spectator(id)` still answers. Guests see the member list change. |
 | `member_interrupted(id)`, `member_resumed(id)`, `connection_interrupted`, `connection_resumed` | Dropped connections and their return. |
 | `preparing(config)`, `started(config, start_usec)`, `returned` | Load the match; play it; back in the lobby. |
 
@@ -238,7 +238,8 @@ Leaving on purpose (`close()`) or being kicked sends a reason with the disconnec
 | Layer | Signals |
 |---|---|
 | `LocalNetLink` | `peer_interrupted(id)`, `peer_resumed(id)`, `peer_disconnected(id, reason)`, where the reason is "left", "kicked" or "lost". `interrupted_peers()` and `reconnect_seconds_left(id)` support a countdown. |
-| `LocalNetLobby`, everyone | `member_interrupted(id)`, `member_resumed(id)`, `member_left(id, reason)`, and each member's `connected` flag. `can_start()` waits for every player to be connected. These fire for spectators too (see Players and spectators). |
+| `LocalNetLobby`, everyone | `member_interrupted(id)`, `member_resumed(id)`, and each member's `connected` flag. `can_start()` waits for every player to be connected. These fire for spectators too: check `is_spectator(id)` before acting on them (see Players and spectators). |
+| `LocalNetLobby`, host | `member_left(id, reason)`, for spectators too; `is_spectator(id)` still answers for a member that has left. Guests see the member list change. |
 | `LocalNetLobby`, guest | `connection_interrupted`, `connection_resumed`. When the window runs out: `closed("Lost connection to the host")`. |
 
 Anything the host sent while a guest was away is lost, so on resume it resends the member list and settings, and whether a match started, is loading or has ended. A guest that missed the start joins the match on the same clock as everyone else. A guest that comes back after the host has let it go is told so, rather than being let in as a stranger.
@@ -304,7 +305,7 @@ Spectators have slot −1, and a spectator falling off or lagging never stops th
 
 With `wait_for_loading`, the start waits for every player (and the host) to load, then for spectators still loading only up to `spectator_load_wait_msec` more, and not at all for one whose connection has dropped. A spectator that loads in time starts the match at once. One that loads later gets `started` when it calls `mark_loaded()`, with the match's own start time, as a guest that missed the start does, and catches up within `keep_ticks` or is dropped. Since transfers pause once a match is preparing, a spectator still fetching content simply doesn't load in time; it carries on fetching back in the lobby and watches the next match.
 
-`member_interrupted`, `member_resumed` and `member_left` fire for spectators as well as players, so a game should check which it is before acting on them: one that ends a match whenever a member leaves would end it when a spectator leaves. For the first two, `is_spectator(id)` says. `member_left` fires after the member has gone from `members`, when `is_spectator(id)` can no longer tell, so keep the ids that were playing (`players()`) when the match started, as the [examples](#examples) do. The exception is a host that doesn't play. It's a spectator by role, but it's the hub every device connects through and there's no host migration, so it's waited for like a player (its loading and, with `can_start(..., true)`, its content), and when it goes, the session ends for everyone, as with any host (`closed` on the guests).
+`member_interrupted`, `member_resumed` and `member_left` fire for spectators as well as players, so a game should check `is_spectator(id)` before acting on them: one that ends a match whenever a member leaves would end it when a spectator leaves. A member is gone from `members` by the time `member_left` fires, but the host remembers its role for the rest of the session, so `is_spectator(id)` still answers. The exception is a host that doesn't play. It's a spectator by role, but it's the hub every device connects through and there's no host migration, so it's waited for like a player (its loading and, with `can_start(..., true)`, its content), and when it goes, the session ends for everyone, as with any host (`closed` on the guests).
 
 A navigator or co-driver isn't a role. Anything that changes the game has to reach every device, so in lockstep a co-driver is just another player slot whose input means something else; the game says so in member data.
 
@@ -435,7 +436,7 @@ Change LocalNet in this repo, never in a game's copy. After the tests pass, bump
 ## Tests
 
 ```sh
-godot --headless --path . --script tests/test_localnet.gd   # 447 checks, about 3 minutes
+godot --headless --path . --script tests/test_localnet.gd   # 452 checks, about 3 minutes
 godot --headless --path . --script tests/test_demo.gd       # 41 checks, about 2½ minutes
 godot --headless --path . --script tests/test_examples.gd   # 64 checks, about 35 seconds
 ```
@@ -478,6 +479,7 @@ godot --headless --path . --script tests/test_examples.gd   # 64 checks, about 3
   - with `wait_for_loading`, a spectator still fetching content not holding up `can_start(false, true)`, and the start waiting `spectator_load_wait_msec` for spectators' loading, not at all with 0, and no longer than a spectator takes to load;
   - a spectator that loads after the match has begun joining on the match's clock and following it, or dropped and told so once more than `keep_ticks` behind, while the players never stall;
   - players and spectators counted apart in `can_start()`, the advert, slot numbering and the suggested delay;
+  - `is_spectator()` still knowing a member's role in `member_left`, after it has left, until a new session;
   - a host that doesn't play starting two guests' lockstep match, identical inputs and checksums on all three devices, over a clean and a lossy link;
   - a spectator following a lockstep match;
   - a player and a spectator held back by the default `min_players` of 2, then starting and playing a lockstep match with it at 1, and a start always needing a player;
@@ -512,7 +514,7 @@ godot --headless --path . --script tests/test_examples.gd   # 64 checks, about 3
 - 8 MB of content fetched before a match;
 - every process quitting on its own.
 
-`test_examples.gd` plays each of the [examples](#examples) with a host and its guests in one process, through the examples' own functions: finding the host by discovery, joining, starting, playing with keys held until every device shows the same dots and checksums, coming back to the lobby, and the guests going home when the host leaves. Along the way it checks ready flags and a rematch, a spectator with no slot leaving without ending anything, the solo lobby able to start alone and keeping both settings merged one at a time, a host that doesn't play, and a stage fetched, cached by its hash and loaded the same everywhere.
+`test_examples.gd` plays each of the [examples](#examples) with a host and its guests in one process, through the examples' own functions: finding the host by discovery, joining, starting, playing with keys held until every device shows the same dots and checksums, coming back to the lobby, and the guests going home when the host leaves. Along the way it checks ready flags and a rematch, a spectator with no slot leaving mid-match without ending it, the solo lobby able to start alone and keeping both settings merged one at a time, a host that doesn't play, and a stage fetched, cached by its hash and loaded the same everywhere.
 
 ## Measurements (2026-09-28)
 
