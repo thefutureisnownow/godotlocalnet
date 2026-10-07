@@ -2,7 +2,7 @@
 
 Offline local multiplayer for Godot 4: discovery, a lobby with clock sync, players and spectators, automatic input delay, rematches and reconnects, content transfer by hash, and lockstep with time sync. It needs no internet, router, WebRTC or native code.
 
-This folder is published from [stained/godotlocalnet](https://github.com/stained/godotlocalnet), which holds the full documentation, the wire protocol, the test suites and a link test app.
+This folder is published from [stained/godotlocalnet](https://github.com/stained/godotlocalnet), which holds a getting-started guide, five example games, the full documentation, the wire protocol, the test suites and a link test app. Every class is also documented in Godot's built-in help (F1, then type `LocalNetLobby`, say).
 
 **Don't edit this folder inside a game.** Change LocalNet in its own repo, run its tests, publish with `tools/publish_addon.sh`, then pull the update into the game (in Snoek'em, `tools/update_localnet.sh`). `VERSION` says which release this copy is.
 
