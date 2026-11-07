@@ -12,9 +12,9 @@ LocalNet is a folder of scripts. Copy [`addons/localnet`](addons/localnet) into 
 
 ```sh
 # Once, in the game's repo:
-git subtree add --prefix=addons/localnet https://github.com/stained/godotlocalnet addon --squash
+git subtree add --prefix=addons/localnet https://github.com/thefutureisnownow/godotlocalnet addon --squash
 # For each update:
-git subtree pull --prefix=addons/localnet https://github.com/stained/godotlocalnet addon --squash
+git subtree pull --prefix=addons/localnet https://github.com/thefutureisnownow/godotlocalnet addon --squash
 ```
 
 The scripts register their class names, so there's no plugin to enable. LocalNet is developed and tested with Godot 4.7. Android exports need the `INTERNET`, `ACCESS_NETWORK_STATE`, `ACCESS_WIFI_STATE` and `CHANGE_WIFI_MULTICAST_STATE` permissions, and iOS exports need `NSLocalNetworkUsageDescription` (see [Platform notes](#platform-notes)).
@@ -529,3 +529,7 @@ All runs are 120 Hz with an input delay of 3 ticks (25 ms). Lateness is how long
 | A22 hotspot, iPad 9th gen as a third player | Free-run | The iPad's link alone had p99 190–250 ms and max 515–600 ms, in both directions. The A22 ↔ iPhone link stayed clean, and relaying through the host added about 10 ms. |
 
 On a phone hotspot, plain lockstep at 3–4 ticks is responsive and smooth. A home router, or a device with a poor Wi-Fi link, has a long tail. That is where the automatic delay and, later, rollback matter.
+
+## License
+
+MIT, see [LICENSE](LICENSE). A copy sits in `addons/localnet/`, so the `addon` branch (and any project that pulls it) carries it too.
